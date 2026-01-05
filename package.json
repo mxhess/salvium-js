@@ -1,0 +1,40 @@
+{
+  "name": "salvium-js",
+  "version": "0.1.0",
+  "description": "JavaScript library for Salvium cryptocurrency - address validation, parsing, and signature verification",
+  "main": "src/index.js",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./address": "./src/address.js",
+    "./base58": "./src/base58.js",
+    "./keccak": "./src/keccak.js",
+    "./signature": "./src/signature.js",
+    "./constants": "./src/constants.js"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "keywords": [
+    "salvium",
+    "cryptocurrency",
+    "cryptonote",
+    "carrot",
+    "address",
+    "validation",
+    "base58",
+    "keccak"
+  ],
+  "author": "WhiskyMine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whiskymine/salvium-js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "browser": {
+    "./src/keccak.js": "./src/keccak.browser.js"
+  }
+}
