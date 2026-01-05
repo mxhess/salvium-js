@@ -1,6 +1,6 @@
 /**
  * CARROT Key Derivation Functions
- * Implements key derivation as per Salvium/Monero CARROT specification
+ * Implements key derivation as per Salvium CARROT specification
  */
 
 import { blake2b } from './blake2b.js';

@@ -118,7 +118,7 @@ export const ADDRESS_DATA_SIZE = {
   [ADDRESS_TYPE.SUBADDRESS]: KEY_SIZE * 2                           // spend_key + view_key = 64 bytes
 };
 
-// Base58 alphabet (Monero variant)
+// Base58 alphabet (CryptoNote variant)
 export const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 // Full block size for Base58 encoding (8 bytes -> 11 chars)

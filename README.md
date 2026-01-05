@@ -8,7 +8,7 @@ JavaScript library for Salvium cryptocurrency - address validation, parsing, and
 - **Address Parsing** - Extract public keys, payment IDs, detect network/format/type
 - **Multi-Network Support** - Mainnet, Testnet, Stagenet
 - **Dual Format Support** - Legacy (CryptoNote) and CARROT addresses
-- **Base58 Encoding** - Monero-variant Base58 with checksums
+- **Base58 Encoding** - CryptoNote Base58 with checksums
 - **Keccak-256** - Pre-SHA3 Keccak hashing (cn_fast_hash)
 - **Signature Verification** - Verify message signatures (V1 and V2 formats)
 - **Zero Dependencies** - Pure JavaScript, works in browsers and Node.js

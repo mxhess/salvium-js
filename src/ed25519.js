@@ -1,7 +1,7 @@
 /**
  * Ed25519 Elliptic Curve Operations
  *
- * Direct port from Salvium/Monero ref10 logic using BigInt for correctness.
+ * Direct port from Salvium ref10 logic using BigInt for correctness.
  * Field elements are represented as BigInt in range [0, p) where p = 2^255 - 19
  */
 

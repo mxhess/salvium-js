@@ -18,6 +18,11 @@ import {
   getPrefix
 } from './constants.js';
 import { decodeAddress, encodeAddress } from './base58.js';
+import {
+  cnSubaddress,
+  carrotSubaddress,
+  generatePaymentId as genPaymentId
+} from './subaddress.js';
 
 /**
  * Result of parsing an address
@@ -393,6 +398,111 @@ export function hexToBytes(hex) {
   return bytes;
 }
 
+// ============================================================================
+// Subaddress Generation
+// ============================================================================
+
+/**
+ * Generate a CryptoNote (Legacy) subaddress
+ * @param {Object} options - Subaddress options
+ * @param {string} options.network - Network type (mainnet, testnet, stagenet)
+ * @param {Uint8Array} options.spendPublicKey - 32-byte main spend public key
+ * @param {Uint8Array} options.viewSecretKey - 32-byte view secret key
+ * @param {number} options.major - Major index (account)
+ * @param {number} options.minor - Minor index (address within account)
+ * @returns {Object} { address, spendPublicKey, viewPublicKey }
+ */
+export function generateCNSubaddress(options) {
+  const { network, spendPublicKey, viewSecretKey, major, minor } = options;
+
+  // Generate subaddress keys
+  const keys = cnSubaddress(spendPublicKey, viewSecretKey, major, minor);
+
+  // Create the address string
+  const address = createAddress({
+    network,
+    format: ADDRESS_FORMAT.LEGACY,
+    type: ADDRESS_TYPE.SUBADDRESS,
+    spendPublicKey: keys.spendPublicKey,
+    viewPublicKey: keys.viewPublicKey
+  });
+
+  return {
+    address,
+    spendPublicKey: keys.spendPublicKey,
+    viewPublicKey: keys.viewPublicKey,
+    major,
+    minor
+  };
+}
+
+/**
+ * Generate a CARROT subaddress
+ * @param {Object} options - Subaddress options
+ * @param {string} options.network - Network type (mainnet, testnet, stagenet)
+ * @param {Uint8Array} options.accountSpendPubkey - K_s (32 bytes)
+ * @param {Uint8Array} options.accountViewPubkey - K_v = k_vi × K_s (32 bytes)
+ * @param {Uint8Array} options.generateAddressSecret - s_ga (32 bytes)
+ * @param {number} options.major - Major index
+ * @param {number} options.minor - Minor index
+ * @returns {Object} { address, spendPublicKey, viewPublicKey, isMainAddress }
+ */
+export function generateCarrotSubaddress(options) {
+  const { network, accountSpendPubkey, accountViewPubkey, generateAddressSecret, major, minor } = options;
+
+  // Generate subaddress keys
+  const keys = carrotSubaddress(accountSpendPubkey, accountViewPubkey, generateAddressSecret, major, minor);
+
+  // For main address (0,0), use standard type; otherwise subaddress type
+  const addressType = keys.isMainAddress ? ADDRESS_TYPE.STANDARD : ADDRESS_TYPE.SUBADDRESS;
+
+  // Create the address string
+  const address = createAddress({
+    network,
+    format: ADDRESS_FORMAT.CARROT,
+    type: addressType,
+    spendPublicKey: keys.spendPublicKey,
+    viewPublicKey: keys.viewPublicKey
+  });
+
+  return {
+    address,
+    spendPublicKey: keys.spendPublicKey,
+    viewPublicKey: keys.viewPublicKey,
+    isMainAddress: keys.isMainAddress,
+    major,
+    minor
+  };
+}
+
+/**
+ * Generate a random 8-byte payment ID
+ * @returns {Uint8Array} 8-byte payment ID
+ */
+export function generateRandomPaymentId() {
+  return genPaymentId();
+}
+
+/**
+ * Create an integrated address with a random payment ID
+ * @param {string} address - Standard address
+ * @returns {Object} { address, paymentId } - Integrated address and its payment ID
+ */
+export function createIntegratedAddressWithRandomId(address) {
+  const paymentId = genPaymentId();
+  const integratedAddress = toIntegratedAddress(address, paymentId);
+
+  if (!integratedAddress) {
+    return null;
+  }
+
+  return {
+    address: integratedAddress,
+    paymentId,
+    paymentIdHex: bytesToHex(paymentId)
+  };
+}
+
 export default {
   parseAddress,
   isValidAddress,
@@ -413,5 +523,10 @@ export default {
   toStandardAddress,
   describeAddress,
   bytesToHex,
-  hexToBytes
+  hexToBytes,
+  // Subaddress generation
+  generateCNSubaddress,
+  generateCarrotSubaddress,
+  generateRandomPaymentId,
+  createIntegratedAddressWithRandomId
 };

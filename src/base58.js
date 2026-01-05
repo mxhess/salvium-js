@@ -1,8 +1,8 @@
 /**
- * Monero/Salvium Base58 Encoding/Decoding
+ * CryptoNote Base58 Encoding/Decoding
  *
  * This is NOT the same as Bitcoin's Base58Check!
- * Monero uses a block-based encoding where:
+ * CryptoNote uses a block-based encoding where:
  * - Data is split into 8-byte blocks
  * - Each 8-byte block encodes to exactly 11 Base58 characters
  * - Partial blocks use a size mapping table
@@ -108,7 +108,7 @@ function decodeBlock(block) {
 }
 
 /**
- * Encode binary data to Base58 (Monero variant)
+ * Encode binary data to Base58 (CryptoNote variant)
  * @param {Uint8Array|Array} data - Binary data to encode
  * @returns {string} - Base58 encoded string
  */
@@ -142,7 +142,7 @@ export function encode(data) {
 }
 
 /**
- * Decode Base58 string to binary data (Monero variant)
+ * Decode Base58 string to binary data (CryptoNote variant)
  * @param {string} encoded - Base58 encoded string
  * @returns {Uint8Array|null} - Decoded binary data or null on error
  */

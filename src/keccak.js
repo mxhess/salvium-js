@@ -5,7 +5,7 @@
  * https://github.com/nicolo-ribaudo/js-sha3
  *
  * IMPORTANT: This is Keccak-256, NOT SHA3-256!
- * Monero/Salvium use the pre-NIST version with 0x01 padding.
+ * Salvium uses the pre-NIST version with 0x01 padding.
  */
 
 const KECCAK_PADDING = [1, 256, 65536, 16777216];
@@ -221,7 +221,7 @@ export function keccak256Hex(input) {
 }
 
 /**
- * cn_fast_hash - Salvium/Monero's name for Keccak-256
+ * cn_fast_hash - CryptoNote's name for Keccak-256
  * @param {Uint8Array|Array|string} input - Data to hash
  * @returns {Uint8Array} - 32-byte hash
  */

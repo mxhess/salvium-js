@@ -5,9 +5,10 @@
  * - Address validation and parsing for all 18 address types
  * - Support for Legacy (CryptoNote) and CARROT address formats
  * - Mainnet, Testnet, and Stagenet support
- * - Base58 encoding/decoding (Monero variant)
+ * - Base58 encoding/decoding (CryptoNote variant)
  * - Keccak-256 hashing
  * - Message signature verification (V1 and V2)
+ * - Mnemonic seed encoding/decoding (12 languages)
  *
  * @module salvium-js
  */
@@ -20,6 +21,12 @@ export * from './address.js';
 export * from './signature.js';
 export * from './blake2b.js';
 export * from './carrot.js';
+export * from './subaddress.js';
+export * from './mnemonic.js';
+
+// Wordlists available as separate imports for tree-shaking
+// Usage: import { spanish } from 'salvium-js/wordlists';
+export * as wordlists from './wordlists/index.js';
 export {
   scalarMultBase,
   scalarMultPoint,
@@ -85,12 +92,28 @@ import {
   toStandardAddress,
   describeAddress,
   bytesToHex,
-  hexToBytes
+  hexToBytes,
+  generateCNSubaddress,
+  generateCarrotSubaddress,
+  generateRandomPaymentId,
+  createIntegratedAddressWithRandomId
 } from './address.js';
 
 import {
+  cnSubaddressSecretKey,
+  cnSubaddressSpendPublicKey,
+  cnSubaddress,
+  carrotIndexExtensionGenerator,
+  carrotSubaddressScalar,
+  carrotSubaddress,
+  generatePaymentId,
+  isValidPaymentId
+} from './subaddress.js';
+
+import {
   verifySignature,
-  parseSignature
+  parseSignature,
+  testEd25519
 } from './signature.js';
 
 import {
@@ -103,6 +126,17 @@ import {
   computeCarrotAccountViewPubkey,
   computeCarrotMainAddressViewPubkey
 } from './ed25519.js';
+
+import {
+  WORD_LIST,
+  mnemonicToSeed,
+  seedToMnemonic,
+  validateMnemonic,
+  languages,
+  detectLanguage,
+  getLanguage,
+  getAvailableLanguages
+} from './mnemonic.js';
 
 // Main API object
 const salvium = {
@@ -158,7 +192,35 @@ const salvium = {
   // CARROT
   computeCarrotSpendPubkey,
   computeCarrotAccountViewPubkey,
-  computeCarrotMainAddressViewPubkey
+  computeCarrotMainAddressViewPubkey,
+
+  // Subaddress generation (CryptoNote)
+  cnSubaddressSecretKey,
+  cnSubaddressSpendPublicKey,
+  cnSubaddress,
+  generateCNSubaddress,
+
+  // Subaddress generation (CARROT)
+  carrotIndexExtensionGenerator,
+  carrotSubaddressScalar,
+  carrotSubaddress,
+  generateCarrotSubaddress,
+
+  // Integrated addresses / Payment IDs
+  generatePaymentId,
+  generateRandomPaymentId,
+  isValidPaymentId,
+  createIntegratedAddressWithRandomId,
+
+  // Mnemonic
+  WORD_LIST,
+  mnemonicToSeed,
+  seedToMnemonic,
+  validateMnemonic,
+  languages,
+  detectLanguage,
+  getLanguage,
+  getAvailableLanguages
 };
 
 export default salvium;

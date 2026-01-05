@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Salvium-JS Subaddress Tests</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #00ff41;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1, h2, h3 { color: #39ff14; }
+        .test-section {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .pass { color: #00ff41; }
+        .fail { color: #ff4141; }
+        .info { color: #41a0ff; }
+        pre {
+            background: #1a1a1a;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 12px;
+        }
+        input, button {
+            background: #1a1a1a;
+            color: #00ff41;
+            border: 1px solid #333;
+            padding: 8px 12px;
+            font-family: inherit;
+            margin: 5px;
+        }
+        button:hover { background: #333; cursor: pointer; }
+        .key-input { width: 500px; }
+        #output { min-height: 200px; }
+    </style>
+</head>
+<body>
+    <h1>Salvium-JS Subaddress Tests</h1>
+
+    <div class="test-section">
+        <h2>Test Input</h2>
+        <p>Enter keys from your Salvium wallet to test subaddress generation:</p>
+
+        <h3>CryptoNote (Legacy) Keys:</h3>
+        <div>
+            <label>Spend Public Key (hex):</label><br>
+            <input type="text" id="cnSpendPubKey" class="key-input" placeholder="32-byte hex (64 chars)">
+        </div>
+        <div>
+            <label>View Secret Key (hex):</label><br>
+            <input type="text" id="cnViewSecKey" class="key-input" placeholder="32-byte hex (64 chars)">
+        </div>
+
+        <h3>CARROT Keys:</h3>
+        <div>
+            <label>Account Spend Pubkey K_s (hex):</label><br>
+            <input type="text" id="carrotSpendPubKey" class="key-input" placeholder="32-byte hex (64 chars)">
+        </div>
+        <div>
+            <label>Account View Pubkey K_v = k_vi * K_s (hex):</label><br>
+            <input type="text" id="carrotViewPubKey" class="key-input" placeholder="32-byte hex (64 chars)">
+        </div>
+        <div>
+            <label>Generate Address Secret s_ga (hex):</label><br>
+            <input type="text" id="carrotSga" class="key-input" placeholder="32-byte hex (64 chars)">
+        </div>
+
+        <h3>Subaddress Index:</h3>
+        <div>
+            <label>Major (account):</label>
+            <input type="number" id="major" value="0" min="0" style="width: 80px">
+            <label>Minor (address):</label>
+            <input type="number" id="minor" value="1" min="0" style="width: 80px">
+        </div>
+
+        <div style="margin-top: 15px">
+            <button onclick="testCNSubaddress()">Test CryptoNote Subaddress</button>
+            <button onclick="testCarrotSubaddress()">Test CARROT Subaddress</button>
+            <button onclick="testIntegratedAddress()">Test Integrated Address</button>
+            <button onclick="runAllTests()">Run All Basic Tests</button>
+        </div>
+    </div>
+
+    <div class="test-section">
+        <h2>Output</h2>
+        <pre id="output"></pre>
+    </div>
+
+    <script type="module">
+        import salvium, {
+            hexToBytes,
+            bytesToHex,
+            cnSubaddress,
+            cnSubaddressSecretKey,
+            carrotSubaddress,
+            carrotIndexExtensionGenerator,
+            carrotSubaddressScalar,
+            generateCNSubaddress,
+            generateCarrotSubaddress,
+            generatePaymentId,
+            isValidPaymentId,
+            toIntegratedAddress,
+            createIntegratedAddressWithRandomId,
+            parseAddress,
+            NETWORK,
+            ADDRESS_FORMAT,
+            ADDRESS_TYPE
+        } from '../salvium-js/index.js';
+
+        const output = document.getElementById('output');
+
+        function log(msg, type = '') {
+            const span = document.createElement('span');
+            span.className = type;
+            span.textContent = msg + '\n';
+            output.appendChild(span);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function clearOutput() {
+            output.innerHTML = '';
+        }
+
+        window.testCNSubaddress = function() {
+            clearOutput();
+            log('=== CryptoNote Subaddress Test ===', 'info');
+
+            const spendPubKeyHex = document.getElementById('cnSpendPubKey').value.trim();
+            const viewSecKeyHex = document.getElementById('cnViewSecKey').value.trim();
+            const major = parseInt(document.getElementById('major').value);
+            const minor = parseInt(document.getElementById('minor').value);
+
+            if (!spendPubKeyHex || spendPubKeyHex.length !== 64) {
+                log('ERROR: Spend public key must be 64 hex chars', 'fail');
+                return;
+            }
+            if (!viewSecKeyHex || viewSecKeyHex.length !== 64) {
+                log('ERROR: View secret key must be 64 hex chars', 'fail');
+                return;
+            }
+
+            try {
+                const spendPubKey = hexToBytes(spendPubKeyHex);
+                const viewSecKey = hexToBytes(viewSecKeyHex);
+
+                log(`Input spend pubkey: ${spendPubKeyHex}`);
+                log(`Input view seckey:  ${viewSecKeyHex}`);
+                log(`Index: (${major}, ${minor})`);
+                log('');
+
+                // Generate subaddress using low-level function
+                const subKeys = cnSubaddress(spendPubKey, viewSecKey, major, minor);
+                log(`Subaddress spend pubkey: ${bytesToHex(subKeys.spendPublicKey)}`);
+                log(`Subaddress view pubkey:  ${bytesToHex(subKeys.viewPublicKey)}`);
+
+                // Generate full address string
+                const result = generateCNSubaddress({
+                    network: NETWORK.MAINNET,
+                    spendPublicKey: spendPubKey,
+                    viewSecretKey: viewSecKey,
+                    major,
+                    minor
+                });
+
+                log('');
+                log('Generated subaddress:', 'pass');
+                log(result.address);
+
+                // Parse it back
+                const parsed = parseAddress(result.address);
+                log('');
+                log('Parsed result:', 'info');
+                log(`  Valid: ${parsed.valid}`);
+                log(`  Network: ${parsed.network}`);
+                log(`  Format: ${parsed.format}`);
+                log(`  Type: ${parsed.type}`);
+
+            } catch (e) {
+                log(`ERROR: ${e.message}`, 'fail');
+                console.error(e);
+            }
+        };
+
+        window.testCarrotSubaddress = function() {
+            clearOutput();
+            log('=== CARROT Subaddress Test ===', 'info');
+
+            const spendPubKeyHex = document.getElementById('carrotSpendPubKey').value.trim();
+            const viewPubKeyHex = document.getElementById('carrotViewPubKey').value.trim();
+            const sgaHex = document.getElementById('carrotSga').value.trim();
+            const major = parseInt(document.getElementById('major').value);
+            const minor = parseInt(document.getElementById('minor').value);
+
+            if (!spendPubKeyHex || spendPubKeyHex.length !== 64) {
+                log('ERROR: K_s must be 64 hex chars', 'fail');
+                return;
+            }
+            if (!viewPubKeyHex || viewPubKeyHex.length !== 64) {
+                log('ERROR: K_v must be 64 hex chars', 'fail');
+                return;
+            }
+            if (!sgaHex || sgaHex.length !== 64) {
+                log('ERROR: s_ga must be 64 hex chars', 'fail');
+                return;
+            }
+
+            try {
+                const K_s = hexToBytes(spendPubKeyHex);
+                const K_v = hexToBytes(viewPubKeyHex);
+                const s_ga = hexToBytes(sgaHex);
+
+                log(`Input K_s (account spend): ${spendPubKeyHex}`);
+                log(`Input K_v (account view):  ${viewPubKeyHex}`);
+                log(`Input s_ga:                ${sgaHex}`);
+                log(`Index: (${major}, ${minor})`);
+                log('');
+
+                // Show intermediate values
+                const indexGen = carrotIndexExtensionGenerator(s_ga, major, minor);
+                log(`s^j_gen (index generator): ${bytesToHex(indexGen)}`);
+
+                const subScalar = carrotSubaddressScalar(K_s, indexGen, major, minor);
+                log(`k^j_subscal (subaddr scalar): ${bytesToHex(subScalar)}`);
+
+                // Generate subaddress keys
+                const subKeys = carrotSubaddress(K_s, K_v, s_ga, major, minor);
+                log('');
+                log(`K^j_s (subaddr spend): ${bytesToHex(subKeys.spendPublicKey)}`);
+                log(`K^j_v (subaddr view):  ${bytesToHex(subKeys.viewPublicKey)}`);
+                log(`Is main address: ${subKeys.isMainAddress}`);
+
+                // Generate full address
+                const result = generateCarrotSubaddress({
+                    network: NETWORK.MAINNET,
+                    accountSpendPubkey: K_s,
+                    accountViewPubkey: K_v,
+                    generateAddressSecret: s_ga,
+                    major,
+                    minor
+                });
+
+                log('');
+                log('Generated address:', 'pass');
+                log(result.address);
+
+                // Parse it back
+                const parsed = parseAddress(result.address);
+                log('');
+                log('Parsed result:', 'info');
+                log(`  Valid: ${parsed.valid}`);
+                log(`  Network: ${parsed.network}`);
+                log(`  Format: ${parsed.format}`);
+                log(`  Type: ${parsed.type}`);
+
+            } catch (e) {
+                log(`ERROR: ${e.message}`, 'fail');
+                console.error(e);
+            }
+        };
+
+        window.testIntegratedAddress = function() {
+            clearOutput();
+            log('=== Integrated Address Test ===', 'info');
+
+            // Test with a sample mainnet address
+            const testAddress = 'SaLv1yGGnq7oc3mfjVJTXYJZGqo8SqiQx7tCm8KhJeWE6vwTJWyc8sX1pTJRbVi4d4pAjUo8mSXVPHVMBt6fG3gF2Nk4cCBZ1e';
+
+            try {
+                // Generate random payment ID
+                const paymentId = generatePaymentId();
+                log(`Generated payment ID: ${bytesToHex(paymentId)}`);
+                log(`Is valid: ${isValidPaymentId(paymentId)}`, isValidPaymentId(paymentId) ? 'pass' : 'fail');
+
+                // Create integrated address
+                const integrated = toIntegratedAddress(testAddress, paymentId);
+                if (integrated) {
+                    log('');
+                    log('Integrated address:', 'pass');
+                    log(integrated);
+
+                    const parsed = parseAddress(integrated);
+                    log('');
+                    log('Parsed result:', 'info');
+                    log(`  Valid: ${parsed.valid}`);
+                    log(`  Type: ${parsed.type}`);
+                    log(`  Payment ID: ${bytesToHex(parsed.paymentId)}`);
+                } else {
+                    log('Failed to create integrated address', 'fail');
+                }
+
+                // Test createIntegratedAddressWithRandomId
+                log('');
+                log('Testing createIntegratedAddressWithRandomId...', 'info');
+                const result = createIntegratedAddressWithRandomId(testAddress);
+                if (result) {
+                    log(`Address: ${result.address}`);
+                    log(`Payment ID: ${result.paymentIdHex}`, 'pass');
+                } else {
+                    log('Failed', 'fail');
+                }
+
+            } catch (e) {
+                log(`ERROR: ${e.message}`, 'fail');
+                console.error(e);
+            }
+        };
+
+        window.runAllTests = function() {
+            clearOutput();
+            log('=== Running Basic Tests ===', 'info');
+            log('');
+
+            let passed = 0;
+            let failed = 0;
+
+            // Test 1: Payment ID generation
+            log('Test 1: Payment ID generation...', 'info');
+            try {
+                const pid = generatePaymentId();
+                if (pid.length === 8 && isValidPaymentId(pid)) {
+                    log('  PASS: Generated valid 8-byte payment ID', 'pass');
+                    passed++;
+                } else {
+                    log('  FAIL: Invalid payment ID', 'fail');
+                    failed++;
+                }
+            } catch (e) {
+                log(`  FAIL: ${e.message}`, 'fail');
+                failed++;
+            }
+
+            // Test 2: All-zeros payment ID should be invalid
+            log('Test 2: All-zeros payment ID validation...', 'info');
+            const zeros = new Uint8Array(8);
+            if (!isValidPaymentId(zeros)) {
+                log('  PASS: All-zeros payment ID correctly rejected', 'pass');
+                passed++;
+            } else {
+                log('  FAIL: All-zeros should be invalid', 'fail');
+                failed++;
+            }
+
+            // Test 3: CryptoNote subaddress with test vectors
+            log('Test 3: CryptoNote subaddress derivation...', 'info');
+            try {
+                // Use dummy keys for structure test
+                const dummySpend = new Uint8Array(32);
+                const dummyView = new Uint8Array(32);
+                dummySpend[0] = 1;
+                dummyView[0] = 2;
+
+                // Main address (0,0) should return original keys
+                const main = cnSubaddress(dummySpend, dummyView, 0, 0);
+                if (bytesToHex(main.spendPublicKey) === bytesToHex(dummySpend)) {
+                    log('  PASS: Main address (0,0) returns original spend key', 'pass');
+                    passed++;
+                } else {
+                    log('  FAIL: Main address should return original key', 'fail');
+                    failed++;
+                }
+            } catch (e) {
+                log(`  FAIL: ${e.message}`, 'fail');
+                failed++;
+            }
+
+            // Test 4: CARROT subaddress main address check
+            log('Test 4: CARROT main address detection...', 'info');
+            try {
+                const K_s = new Uint8Array(32);
+                const K_v = new Uint8Array(32);
+                const s_ga = new Uint8Array(32);
+                K_s[0] = 1;
+                K_v[0] = 2;
+                s_ga[0] = 3;
+
+                const main = carrotSubaddress(K_s, K_v, s_ga, 0, 0);
+                if (main.isMainAddress) {
+                    log('  PASS: (0,0) correctly identified as main address', 'pass');
+                    passed++;
+                } else {
+                    log('  FAIL: Should be main address', 'fail');
+                    failed++;
+                }
+
+                const sub = carrotSubaddress(K_s, K_v, s_ga, 0, 1);
+                if (!sub.isMainAddress) {
+                    log('  PASS: (0,1) correctly identified as subaddress', 'pass');
+                    passed++;
+                } else {
+                    log('  FAIL: Should not be main address', 'fail');
+                    failed++;
+                }
+            } catch (e) {
+                log(`  FAIL: ${e.message}`, 'fail');
+                failed++;
+            }
+
+            // Summary
+            log('');
+            log('=== Summary ===', 'info');
+            log(`Passed: ${passed}`, 'pass');
+            log(`Failed: ${failed}`, failed > 0 ? 'fail' : 'pass');
+        };
+
+        // Run basic tests on load
+        window.onload = () => {
+            log('Salvium-JS Subaddress Test Suite loaded.', 'info');
+            log('Enter your wallet keys above to test, or click "Run All Basic Tests" for unit tests.');
+            log('');
+        };
+    </script>
+</body>
+</html>
