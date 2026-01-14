@@ -1,15 +1,18 @@
 # salvium-js
 
-JavaScript library for Salvium cryptocurrency - address validation, parsing, and cryptographic utilities.
+JavaScript library for Salvium cryptocurrency - address handling, RPC clients, key derivation, and cryptographic utilities.
 
 ## Features
 
 - **Address Validation** - Validate all 18 Salvium address types
 - **Address Parsing** - Extract public keys, payment IDs, detect network/format/type
+- **Subaddress Generation** - Generate CryptoNote and CARROT subaddresses
+- **Integrated Addresses** - Create and parse integrated addresses with payment IDs
+- **Mnemonic Support** - 25-word seed phrases in 12 languages
+- **RPC Clients** - Full daemon and wallet RPC implementations
 - **Multi-Network Support** - Mainnet, Testnet, Stagenet
 - **Dual Format Support** - Legacy (CryptoNote) and CARROT addresses
-- **Base58 Encoding** - CryptoNote Base58 with checksums
-- **Keccak-256** - Pre-SHA3 Keccak hashing (cn_fast_hash)
+- **Key Derivation** - CryptoNote and CARROT key derivation from seeds
 - **Signature Verification** - Verify message signatures (V1 and V2 formats)
 - **Zero Dependencies** - Pure JavaScript, works in browsers and Node.js
 
@@ -215,6 +218,183 @@ console.log(sig);
 |----------|-------------|
 | `verifySignature(message, address, signature)` | Verify a message signature, returns result object |
 | `parseSignature(signature)` | Parse signature string into components |
+
+## RPC Clients
+
+Full-featured RPC clients for interacting with Salvium daemon and wallet services.
+
+### Default Ports (from cryptonote_config.h)
+
+| Service | Mainnet | Testnet | Stagenet |
+|---------|---------|---------|----------|
+| Daemon RPC | 19081 | 29081 | 39081 |
+| ZMQ RPC | 19082 | 29082 | 39082 |
+| Wallet RPC* | 19082 | 29082 | 39082 |
+
+*Wallet RPC has no default in source - port is user-specified, conventionally daemon+1
+
+### Daemon RPC
+
+```javascript
+import { createDaemonRPC } from 'salvium-js/rpc';
+
+const daemon = createDaemonRPC({ url: 'http://localhost:19081' });
+
+// Get node info
+const info = await daemon.getInfo();
+if (info.success) {
+  console.log('Height:', info.result.height);
+  console.log('Synchronized:', info.result.synchronized);
+}
+
+// Get block by height
+const block = await daemon.getBlockHeaderByHeight(100000);
+
+// Get transactions
+const txs = await daemon.getTransactions(['txhash1', 'txhash2']);
+
+// Mining
+const template = await daemon.getBlockTemplate({
+  wallet_address: 'SaLv...',
+  reserve_size: 8
+});
+```
+
+### Wallet RPC
+
+```javascript
+import { createWalletRPC, PRIORITY } from 'salvium-js/rpc';
+
+const wallet = createWalletRPC({
+  url: 'http://localhost:19082',
+  username: 'user',      // optional
+  password: 'pass'       // optional
+});
+
+// Open wallet
+await wallet.openWallet({ filename: 'mywallet', password: 'secret' });
+
+// Get balance
+const balance = await wallet.getBalance();
+if (balance.success) {
+  console.log('Balance:', balance.result.balance / 1e8, 'SAL');
+  console.log('Unlocked:', balance.result.unlocked_balance / 1e8, 'SAL');
+}
+
+// Send transaction
+const tx = await wallet.transfer({
+  destinations: [{ address: 'SaLv...', amount: 100000000 }], // 1 SAL
+  priority: PRIORITY.NORMAL
+});
+
+// Get transaction history
+const transfers = await wallet.getTransfers({ in: true, out: true });
+```
+
+### RPC Client Options
+
+```javascript
+import { createDaemonRPC } from 'salvium-js/rpc';
+
+const daemon = createDaemonRPC({
+  url: 'http://localhost:19081',
+  timeout: 30000,        // Request timeout in ms (default: 30000)
+  retries: 2,            // Retry attempts (default: 2)
+  retryDelay: 1000,      // Delay between retries in ms (default: 1000)
+  username: 'user',      // HTTP basic auth username
+  password: 'pass'       // HTTP basic auth password
+});
+```
+
+### Available Daemon RPC Methods
+
+- **Network**: `getInfo`, `getHeight`, `syncInfo`, `hardForkInfo`, `getNetStats`, `getConnections`, `getPeerList`
+- **Blocks**: `getBlockHash`, `getBlock`, `getBlockHeaderByHash`, `getBlockHeaderByHeight`, `getBlockHeadersRange`, `getLastBlockHeader`
+- **Transactions**: `getTransactions`, `getTransactionPool`, `sendRawTransaction`, `relayTx`
+- **Outputs**: `getOuts`, `getOutputHistogram`, `getOutputDistribution`, `isKeyImageSpent`
+- **Mining**: `getBlockTemplate`, `submitBlock`, `getMinerData`, `calcPow`
+- **Fees**: `getFeeEstimate`, `getBaseFeeEstimate`, `getCoinbaseTxSum`
+
+### Available Wallet RPC Methods
+
+- **Wallet**: `createWallet`, `openWallet`, `closeWallet`, `restoreDeterministicWallet`, `generateFromKeys`
+- **Accounts**: `getAccounts`, `createAccount`, `labelAccount`, `getAddress`, `createAddress`
+- **Balance**: `getBalance`, `getTransfers`, `getTransferByTxid`, `incomingTransfers`
+- **Transfers**: `transfer`, `transferSplit`, `sweepAll`, `sweepSingle`, `sweepDust`
+- **Proofs**: `getTxKey`, `checkTxKey`, `getTxProof`, `checkTxProof`, `getReserveProof`
+- **Keys**: `queryKey`, `getMnemonic`, `exportOutputs`, `importOutputs`, `exportKeyImages`
+- **Signing**: `sign`, `verify`, `signMultisig`, `submitMultisig`
+
+## Subaddress Generation
+
+```javascript
+import { generateCNSubaddress, generateCarrotSubaddress } from 'salvium-js';
+
+// Generate CryptoNote subaddress
+const cnSub = generateCNSubaddress(
+  spendPublicKey,    // Uint8Array(32)
+  viewSecretKey,     // Uint8Array(32)
+  0,                 // account index
+  1,                 // address index
+  'mainnet'
+);
+console.log(cnSub.address); // SaLvs...
+
+// Generate CARROT subaddress
+const carrotSub = generateCarrotSubaddress(
+  spendPublicKey,    // K_s
+  viewPublicKey,     // K_v
+  generateAddress,   // s_ga (32-byte secret)
+  0,                 // account index
+  1,                 // address index
+  'mainnet'
+);
+console.log(carrotSub.address); // SC1s...
+```
+
+## Mnemonic Seeds
+
+```javascript
+import { mnemonicToSeed, seedToMnemonic, validateMnemonic, LANGUAGES } from 'salvium-js';
+
+// Convert mnemonic to seed
+const result = mnemonicToSeed('word1 word2 ... word25', 'english');
+if (result.valid) {
+  console.log('Seed:', result.seed); // Uint8Array(32)
+}
+
+// Convert seed to mnemonic
+const mnemonic = seedToMnemonic(seedBytes, 'english');
+
+// Validate mnemonic
+const validation = validateMnemonic('word1 word2 ...', 'english');
+console.log(validation.valid, validation.error);
+
+// Available languages
+console.log(LANGUAGES);
+// ['english', 'spanish', 'french', 'italian', 'german', 'portuguese',
+//  'russian', 'japanese', 'chinese_simplified', 'dutch', 'esperanto', 'lojban']
+```
+
+## Key Derivation
+
+```javascript
+import { deriveKeys, deriveCarrotKeys } from 'salvium-js';
+
+// CryptoNote key derivation from seed
+const cnKeys = deriveKeys(seed); // Uint8Array(32)
+// {
+//   spendSecretKey, spendPublicKey,
+//   viewSecretKey, viewPublicKey
+// }
+
+// CARROT key derivation
+const carrotKeys = deriveCarrotKeys(seed);
+// {
+//   k_ps, k_gi, k_vi, s_ga, s_vb,
+//   spendPublicKey, viewPublicKey
+// }
+```
 
 ## Contributing
 

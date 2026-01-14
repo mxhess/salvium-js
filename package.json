@@ -1,7 +1,7 @@
 {
   "name": "salvium-js",
-  "version": "0.1.0",
-  "description": "JavaScript library for Salvium cryptocurrency - address validation, parsing, and signature verification",
+  "version": "0.2.0",
+  "description": "JavaScript library for Salvium cryptocurrency - address validation, RPC clients, cryptographic operations",
   "main": "src/index.js",
   "type": "module",
   "exports": {
@@ -10,7 +10,17 @@
     "./base58": "./src/base58.js",
     "./keccak": "./src/keccak.js",
     "./signature": "./src/signature.js",
-    "./constants": "./src/constants.js"
+    "./constants": "./src/constants.js",
+    "./blake2b": "./src/blake2b.js",
+    "./carrot": "./src/carrot.js",
+    "./subaddress": "./src/subaddress.js",
+    "./mnemonic": "./src/mnemonic.js",
+    "./ed25519": "./src/ed25519.js",
+    "./wordlists": "./src/wordlists/index.js",
+    "./rpc": "./src/rpc/index.js",
+    "./rpc/client": "./src/rpc/client.js",
+    "./rpc/daemon": "./src/rpc/daemon.js",
+    "./rpc/wallet": "./src/rpc/wallet.js"
   },
   "scripts": {
     "test": "node test/run.js"
@@ -23,7 +33,12 @@
     "address",
     "validation",
     "base58",
-    "keccak"
+    "keccak",
+    "rpc",
+    "wallet",
+    "daemon",
+    "blockchain",
+    "mnemonic"
   ],
   "author": "WhiskyMine",
   "license": "MIT",

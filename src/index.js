@@ -9,6 +9,7 @@
  * - Keccak-256 hashing
  * - Message signature verification (V1 and V2)
  * - Mnemonic seed encoding/decoding (12 languages)
+ * - RPC clients for Daemon and Wallet interaction
  *
  * @module salvium-js
  */
@@ -27,6 +28,21 @@ export * from './mnemonic.js';
 // Wordlists available as separate imports for tree-shaking
 // Usage: import { spanish } from 'salvium-js/wordlists';
 export * as wordlists from './wordlists/index.js';
+
+// RPC clients available as namespace
+// Usage: import { rpc } from 'salvium-js'; or import { DaemonRPC, WalletRPC } from 'salvium-js/rpc';
+export * as rpc from './rpc/index.js';
+export {
+  RPCClient,
+  DaemonRPC,
+  WalletRPC,
+  createDaemonRPC,
+  createWalletRPC,
+  RPC_ERROR_CODES,
+  RPC_STATUS,
+  PRIORITY,
+  TRANSFER_TYPE
+} from './rpc/index.js';
 export {
   scalarMultBase,
   scalarMultPoint,
@@ -138,6 +154,29 @@ import {
   getAvailableLanguages
 } from './mnemonic.js';
 
+import {
+  generateSeed,
+  deriveKeys,
+  deriveCarrotKeys,
+  makeViewBalanceSecret,
+  makeViewIncomingKey,
+  makeProveSpendKey,
+  makeGenerateImageKey,
+  makeGenerateAddressSecret
+} from './carrot.js';
+
+import {
+  RPCClient,
+  DaemonRPC,
+  WalletRPC,
+  createDaemonRPC,
+  createWalletRPC,
+  RPC_ERROR_CODES,
+  RPC_STATUS,
+  PRIORITY,
+  TRANSFER_TYPE
+} from './rpc/index.js';
+
 // Main API object
 const salvium = {
   // Constants
@@ -220,7 +259,32 @@ const salvium = {
   languages,
   detectLanguage,
   getLanguage,
-  getAvailableLanguages
+  getAvailableLanguages,
+
+  // Seed generation
+  generateSeed,
+
+  // Key derivation (CryptoNote)
+  deriveKeys,
+
+  // Key derivation (CARROT)
+  deriveCarrotKeys,
+  makeViewBalanceSecret,
+  makeViewIncomingKey,
+  makeProveSpendKey,
+  makeGenerateImageKey,
+  makeGenerateAddressSecret,
+
+  // RPC
+  RPCClient,
+  DaemonRPC,
+  WalletRPC,
+  createDaemonRPC,
+  createWalletRPC,
+  RPC_ERROR_CODES,
+  RPC_STATUS,
+  PRIORITY,
+  TRANSFER_TYPE
 };
 
 export default salvium;
