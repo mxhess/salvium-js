@@ -249,6 +249,8 @@ export class WalletTransaction {
     // Salvium-specific
     this.txType = data.txType || 3;                  // TX_TYPE
     this.assetType = data.assetType || 'SAL';
+    this.isMinerTx = data.isMinerTx || false;        // Coinbase (block reward)
+    this.isProtocolTx = data.isProtocolTx || false;  // Protocol tx (yields, conversions, refunds)
 
     // Note (user-defined)
     this.note = data.note || '';

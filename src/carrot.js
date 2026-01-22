@@ -6,7 +6,7 @@
 import { blake2b } from './blake2b.js';
 import { keccak256 } from './keccak.js';
 import { hexToBytes, bytesToHex } from './address.js';
-import { scalarMultBase } from './ed25519.js';
+import { scalarMultBase, computeCarrotSpendPubkey, computeCarrotMainAddressViewPubkey, computeCarrotAccountViewPubkey } from './ed25519.js';
 
 // Group order L for scalar reduction
 const L = (1n << 252n) + 27742317777372353535851937790883648493n;
@@ -238,19 +238,74 @@ export function deriveCarrotKeys(masterSecret) {
     masterSecret = hexToBytes(masterSecret);
   }
 
+  // Derive account secrets
   const viewBalanceSecret = makeViewBalanceSecret(masterSecret);
   const proveSpendKey = makeProveSpendKey(masterSecret);
   const viewIncomingKey = makeViewIncomingKey(viewBalanceSecret);
   const generateImageKey = makeGenerateImageKey(viewBalanceSecret);
   const generateAddressSecret = makeGenerateAddressSecret(viewBalanceSecret);
 
+  // Compute account pubkeys
+  // K_s = k_gi * G + k_ps * T
+  const accountSpendPubkey = computeCarrotSpendPubkey(generateImageKey, proveSpendKey);
+  // K^0_v = k_vi * G (primary address view pubkey - for main address)
+  const primaryAddressViewPubkey = computeCarrotMainAddressViewPubkey(viewIncomingKey);
+  // K_v = k_vi * K_s (account view pubkey - for subaddress derivation)
+  const accountViewPubkey = computeCarrotAccountViewPubkey(viewIncomingKey, accountSpendPubkey);
+
   return {
+    // Account secrets
     masterSecret: bytesToHex(masterSecret),
     proveSpendKey: bytesToHex(proveSpendKey),
     viewBalanceSecret: bytesToHex(viewBalanceSecret),
     generateImageKey: bytesToHex(generateImageKey),
     viewIncomingKey: bytesToHex(viewIncomingKey),
-    generateAddressSecret: bytesToHex(generateAddressSecret)
+    generateAddressSecret: bytesToHex(generateAddressSecret),
+    // Account pubkeys (for address generation)
+    accountSpendPubkey: bytesToHex(accountSpendPubkey),
+    primaryAddressViewPubkey: bytesToHex(primaryAddressViewPubkey),
+    accountViewPubkey: bytesToHex(accountViewPubkey)
+  };
+}
+
+/**
+ * Derive CARROT keys for view-only wallet from view-balance secret
+ * Requires account spend pubkey to be provided (can't be derived from s_vb)
+ * @param {Uint8Array|string} viewBalanceSecret - 32-byte view-balance secret or hex string
+ * @param {Uint8Array|string} accountSpendPubkey - 32-byte account spend pubkey or hex string
+ * @returns {Object} Derived keys for view-only scanning
+ */
+export function deriveCarrotViewOnlyKeys(viewBalanceSecret, accountSpendPubkey) {
+  // Convert hex string to bytes if needed
+  if (typeof viewBalanceSecret === 'string') {
+    viewBalanceSecret = hexToBytes(viewBalanceSecret);
+  }
+  if (typeof accountSpendPubkey === 'string') {
+    accountSpendPubkey = hexToBytes(accountSpendPubkey);
+  }
+
+  // Derive keys from view-balance secret
+  const viewIncomingKey = makeViewIncomingKey(viewBalanceSecret);
+  const generateImageKey = makeGenerateImageKey(viewBalanceSecret);
+  const generateAddressSecret = makeGenerateAddressSecret(viewBalanceSecret);
+
+  // Compute account view pubkey: K_v = k_vi * K_s
+  const accountViewPubkey = computeCarrotAccountViewPubkey(viewIncomingKey, accountSpendPubkey);
+  // Primary address view pubkey: K^0_v = k_vi * G
+  const primaryAddressViewPubkey = computeCarrotMainAddressViewPubkey(viewIncomingKey);
+
+  return {
+    // Secrets (view-only subset)
+    viewBalanceSecret: bytesToHex(viewBalanceSecret),
+    viewIncomingKey: bytesToHex(viewIncomingKey),
+    generateImageKey: bytesToHex(generateImageKey),
+    generateAddressSecret: bytesToHex(generateAddressSecret),
+    // Pubkeys
+    accountSpendPubkey: bytesToHex(accountSpendPubkey),
+    primaryAddressViewPubkey: bytesToHex(primaryAddressViewPubkey),
+    accountViewPubkey: bytesToHex(accountViewPubkey),
+    // Flag
+    isViewOnly: true
   };
 }
 
@@ -262,5 +317,6 @@ export default {
   makeProveSpendKey,
   makeGenerateImageKey,
   makeGenerateAddressSecret,
-  deriveCarrotKeys
+  deriveCarrotKeys,
+  deriveCarrotViewOnlyKeys
 };

@@ -550,43 +550,66 @@ export function clsagSign(message, ring, secretKey, commitments, commitmentMask,
   const aG = scalarMultBase(alpha);
   const aH = scalarMultPoint(alpha, H_P);
 
-  // Start the ring: c_{l+1} = H_n(m, aG, aH)
-  let c_next = hashToScalar(CLSAG_ROUND, message, aG, aH);
+  // Build the base hash data (matches Salvium C++ rctSigs.cpp:305-320)
+  // c_to_hash = [domain, P[0..n-1], C[0..n-1], C_offset, message, L, R]
+  // We'll update L and R for each round
+  const buildChallengeHash = (L, R) => {
+    return hashToScalar(CLSAG_ROUND, ...ring, ...C, pseudoOutputCommitment, message, L, R);
+  };
 
-  // Go around the ring
+  // Start the ring: first challenge from alpha commitments
+  let c = buildChallengeHash(aG, aH);
+
+  // c1 will be captured when loop index becomes 0
+  // Per Salvium C++ (rctSigs.cpp:325-326, 364-365):
+  // c1 is saved when i wraps to 0
+  let c1 = null;
+
+  // Start at position after secret index
   let i = (secretIndex + 1) % n;
+
+  // If we start at index 0, capture c1 immediately
+  if (i === 0) {
+    c1 = new Uint8Array(c);
+  }
+
+  // Go around the ring until we reach the secret index
   while (i !== secretIndex) {
-    // Generate random s[i]
+    // Generate random s[i] for this decoy position
     s[i] = scRandom();
 
-    // Compute H_p(P_i)
+    // Compute H_p(P_i) - hash to point of this ring member's public key
     const H_P_i = hashToPoint(ring[i]);
 
-    // L = s[i]*G + c*mu_P*P_i + c*mu_C*C_i
-    const sG = scalarMultBase(s[i]);
-    const c_mu_P = scMul(c_next, mu_P);
-    const c_mu_P_Pi = scalarMultPoint(c_mu_P, ring[i]);
-    const c_mu_C = scMul(c_next, mu_C);
-    const c_mu_C_Ci = scalarMultPoint(c_mu_C, C[i]);
+    // Weighted challenges: c_p = mu_P * c, c_c = mu_C * c
+    const c_mu_P = scMul(c, mu_P);
+    const c_mu_C = scMul(c, mu_C);
 
+    // L = s[i]*G + c_p*P[i] + c_c*C[i]
+    const sG = scalarMultBase(s[i]);
+    const c_mu_P_Pi = scalarMultPoint(c_mu_P, ring[i]);
+    const c_mu_C_Ci = scalarMultPoint(c_mu_C, C[i]);
     const L = pointAddCompressed(pointAddCompressed(sG, c_mu_P_Pi), c_mu_C_Ci);
 
-    // R = s[i]*H_p(P_i) + c*mu_P*I + c*mu_C*D
+    // R = s[i]*H_p(P[i]) + c_p*I + c_c*D
     const sH = scalarMultPoint(s[i], H_P_i);
     const c_mu_P_I = scalarMultPoint(c_mu_P, I);
     const c_mu_C_D = scalarMultPoint(c_mu_C, D);
-
     const R = pointAddCompressed(pointAddCompressed(sH, c_mu_P_I), c_mu_C_D);
 
-    // c_{i+1} = H_n(m, L, R)
-    c_next = hashToScalar(CLSAG_ROUND, message, L, R);
+    // Next challenge: c = H_n(domain, P[0..n-1], C[0..n-1], C_offset, message, L, R)
+    c = buildChallengeHash(L, R);
 
+    // Advance to next ring member
     i = (i + 1) % n;
+
+    // Capture c1 when we wrap to index 0
+    if (i === 0) {
+      c1 = new Uint8Array(c);
+    }
   }
 
-  // The c we computed is c_l (challenge for the real input)
-  const c = c_next;
-
+  // Now c is the challenge at the secret position (c_l)
   // Compute s[l] to close the ring:
   // s[l] = alpha - c * (mu_P * p + mu_C * z)
   const mu_P_p = scMul(mu_P, secretKey);
@@ -595,27 +618,27 @@ export function clsagSign(message, ring, secretKey, commitments, commitmentMask,
   const c_sum = scMul(c, sum);
   s[secretIndex] = scSub(alpha, c_sum);
 
-  // c1 is the challenge for index 0
-  // We need to find c1 from c_l
-  // Actually, c1 is c_{(l+1) mod n} which we computed first
-  // We need to track this properly
+  // If c1 wasn't captured (secretIndex == 0 and n == 1), compute it now
+  // by doing one more round with the completed s[0]
+  if (c1 === null) {
+    // Single member ring or secretIndex caused us to miss capture
+    // Recompute: after s[l] is set, we can compute what c1 would be
+    // by computing L_l, R_l with s[l] and c_l
+    const H_P_l = hashToPoint(ring[secretIndex]);
+    const c_mu_P = scMul(c, mu_P);
+    const c_mu_C = scMul(c, mu_C);
 
-  // Let me recalculate: c1 should be the challenge at index 0
-  // We started at l, computed c_{l+1}, then went around
-  // So we need c_1, which is...
-  // Actually the standard convention is to output c_1 (challenge at index 0)
+    const sG = scalarMultBase(s[secretIndex]);
+    const c_mu_P_Pl = scalarMultPoint(c_mu_P, ring[secretIndex]);
+    const c_mu_C_Cl = scalarMultPoint(c_mu_C, C[secretIndex]);
+    const L = pointAddCompressed(pointAddCompressed(sG, c_mu_P_Pl), c_mu_C_Cl);
 
-  // Recompute c_1 by going from l forward
-  // c_1 = c_{l+1} if l = n-1, otherwise we need to continue
-  let c1;
-  if (secretIndex === n - 1) {
-    // c_{l+1} = c_0 = c_1 (0-indexed, so c at index 0)
-    c1 = hashToScalar(CLSAG_ROUND, message, aG, aH);
-  } else {
-    // We need to compute c_1 from the ring
-    // This is complex, let me restructure...
-    // Actually, the simplest approach is to store c at each step
-    c1 = computeC1(message, ring, C, I, D, mu_P, mu_C, s, secretIndex);
+    const sH = scalarMultPoint(s[secretIndex], H_P_l);
+    const c_mu_P_I = scalarMultPoint(c_mu_P, I);
+    const c_mu_C_D = scalarMultPoint(c_mu_C, D);
+    const R = pointAddCompressed(pointAddCompressed(sH, c_mu_P_I), c_mu_C_D);
+
+    c1 = buildChallengeHash(L, R);
   }
 
   return {
@@ -624,79 +647,6 @@ export function clsagSign(message, ring, secretKey, commitments, commitmentMask,
     I: bytesToHex(I),
     D: bytesToHex(D)
   };
-}
-
-/**
- * Compute c1 for CLSAG signature by verifying the ring
- */
-function computeC1(message, ring, C, I, D, mu_P, mu_C, s, secretIndex) {
-  const n = ring.length;
-
-  // Start from any c and go around to find c1
-  // We use the s values we computed
-
-  // Start from index 1 and compute c_2, c_3, ..., back to c_1
-  // Or just compute starting from c_1 using s[0]
-
-  // Actually, we can use the fact that at index 0, c_1 = H(m, L_0, R_0)
-  // where L_0 = s_0*G + c_0*mu_P*P_0 + c_0*mu_C*C_0
-  // and we need c_0 to compute this
-
-  // The easiest is to verify: start with any c, go around, and the c we get back should be the same
-  // For output, we want c_1, so let's compute the ring starting from s[0]
-
-  // Generate a starting c (we'll compute c_1)
-  // Let's recompute from scratch using the s values
-
-  // Actually for CLSAG, we output c_1 (the challenge at index 0)
-  // When verifying, we start with c_1, compute L_0, R_0 -> c_2, etc.
-
-  // To find c_1, we need to compute backwards or re-derive
-  // The simplest: compute c at index 0 using s[n-1]
-
-  // Let me re-derive c_1 properly by going around the full ring using all s values
-  // Starting from an arbitrary c_0
-  let c = scRandom(); // temporary, we'll compute the real one
-
-  // Compute the ring to find c_1
-  // Actually, let's use the closed-form:
-  // We know s[l] = alpha - c_l * (mu_P * p + mu_C * z)
-  // And we computed everything based on starting at l
-
-  // For now, return the c at index (secretIndex + 1) % n
-  // This is c_1 if secretIndex = 0, otherwise we need to trace
-
-  // Simplified: recompute c_1 by going around with verified s values
-  // Start with index 0
-  const H_P_0 = hashToPoint(ring[0]);
-
-  // We need c_0 to compute L_0, R_0
-  // But c_0 would come from computing L_{n-1}, R_{n-1} which needs c_{n-1}, etc.
-
-  // This is circular. The solution: c_1 is an output of the signing process
-  // In our algorithm, after closing the ring, c_next is c_l
-  // c_1 = c_{l+1 mod n computed at step l+1}
-
-  // Actually I realize the issue: in standard CLSAG,
-  // c_1 is the first challenge computed AFTER closing the ring
-  // i.e., it's H(m, L_0, R_0) where L_0, R_0 use s[0] and c_0
-
-  // Since we computed s[0] to close the ring at index 0, we have c_1 already
-  // It's the c that we got when i became 0
-
-  // Let me trace through: we start at l, compute c_{l+1}
-  // If l = 0: we compute c_1 first (from alpha), then go around, compute s[0] = alpha - c_0 * ...
-  // If l = n-1: we compute c_0 first, then c_1, ..., c_{n-1}, then s[n-1] = alpha - c_{n-1} * ...
-
-  // So c_1 is:
-  // - If l = 0: the first c we computed (from alpha)
-  // - If l > 0: the c computed at step 1 of the loop
-
-  // The code above stores c_next at each step.
-  // c_1 corresponds to the challenge at index 1, which is computed when i = 0
-
-  // Since I don't have access to intermediate values here, let me refactor the main function
-  return new Uint8Array(32); // Placeholder, will fix
 }
 
 /**
@@ -759,6 +709,12 @@ export function clsagVerify(message, sig, ring, commitments, pseudoOutputCommitm
   const mu_P = hashToScalar(CLSAG_AGG_0, ...aggData);
   const mu_C = hashToScalar(CLSAG_AGG_1, ...aggData);
 
+  // Build challenge hash with full ring data (matches Salvium C++ rctSigs.cpp:305-320)
+  // c_to_hash = [domain, P[0..n-1], C[0..n-1], C_offset, message, L, R]
+  const buildChallengeHash = (L, R) => {
+    return hashToScalar(CLSAG_ROUND, ...ring, ...C, pseudoOutputCommitment, message, L, R);
+  };
+
   // Verify the ring
   let c = c1;
   for (let i = 0; i < n; i++) {
@@ -780,8 +736,8 @@ export function clsagVerify(message, sig, ring, commitments, pseudoOutputCommitm
 
     const R = pointAddCompressed(pointAddCompressed(sH, c_mu_P_I), c_mu_C_D);
 
-    // c = H_n(m, L, R)
-    c = hashToScalar(CLSAG_ROUND, message, L, R);
+    // c = H_n(domain, P[0..n-1], C[0..n-1], C_offset, message, L, R)
+    c = buildChallengeHash(L, R);
   }
 
   // After going around the ring, c should equal c1
@@ -918,7 +874,10 @@ export const RCT_TYPE = {
   Bulletproof: 3,
   Bulletproof2: 4,
   CLSAG: 5,
-  BulletproofPlus: 6
+  BulletproofPlus: 6,
+  FullProofs: 7,       // Salvium: BulletproofPlus + CLSAGs + partial salvium_data
+  SalviumZero: 8,      // Salvium: BulletproofPlus + CLSAGs + full salvium_data
+  SalviumOne: 9        // Salvium: BulletproofPlus + TCLSAGs + full salvium_data
 };
 
 /**
@@ -939,6 +898,21 @@ export const TXIN_TYPE = {
   GEN: 0xff,    // Alias
   ToKey: 0x02,  // Regular input
   KEY: 0x02     // Alias
+};
+
+/**
+ * Transaction type constants (from cryptonote_protocol/enums.h)
+ */
+export const TX_TYPE = {
+  UNSET: 0,
+  MINER: 1,
+  PROTOCOL: 2,
+  TRANSFER: 3,
+  CONVERT: 4,
+  BURN: 5,
+  STAKE: 6,
+  RETURN: 7,
+  AUDIT: 8
 };
 
 /**
@@ -1096,6 +1070,69 @@ export function serializeTxPrefix(tx) {
   chunks.push(encodeVarint(extraBytes.length));
   chunks.push(extraBytes);
 
+  // Salvium-specific transaction prefix fields
+  // txType (default: TRANSFER for backward compatibility)
+  const txType = tx.txType ?? TX_TYPE.TRANSFER;
+  chunks.push(encodeVarint(txType));
+
+  // Fields for non-UNSET, non-PROTOCOL transaction types
+  if (txType !== TX_TYPE.UNSET && txType !== TX_TYPE.PROTOCOL) {
+    // amount_burnt
+    chunks.push(encodeVarint(tx.amount_burnt ?? 0n));
+
+    if (txType !== TX_TYPE.MINER) {
+      // Return address handling depends on tx type and version
+      if (txType === TX_TYPE.TRANSFER && tx.version >= 3) {
+        // TRANSFER with version >= 3: return_address_list and change_mask
+        const returnList = tx.return_address_list || [];
+        chunks.push(encodeVarint(returnList.length));
+        for (const addr of returnList) {
+          chunks.push(typeof addr === 'string' ? hexToBytes(addr) : addr);
+        }
+        const changeMask = tx.return_address_change_mask || new Uint8Array(0);
+        chunks.push(encodeVarint(changeMask.length));
+        if (changeMask.length > 0) {
+          chunks.push(changeMask);
+        }
+      } else if (txType === TX_TYPE.STAKE && tx.version >= 4) {
+        // STAKE with CARROT (version >= 4): protocol_tx_data
+        const ptxData = tx.protocol_tx_data || {};
+        chunks.push(encodeVarint(ptxData.version ?? 1));
+        chunks.push(typeof ptxData.return_address === 'string'
+          ? hexToBytes(ptxData.return_address)
+          : (ptxData.return_address || new Uint8Array(32)));
+        chunks.push(typeof ptxData.return_pubkey === 'string'
+          ? hexToBytes(ptxData.return_pubkey)
+          : (ptxData.return_pubkey || new Uint8Array(32)));
+        chunks.push(ptxData.return_view_tag || new Uint8Array(3));
+        chunks.push(ptxData.return_anchor_enc || new Uint8Array(16));
+      } else {
+        // Legacy format: return_address + return_pubkey
+        chunks.push(typeof tx.return_address === 'string'
+          ? hexToBytes(tx.return_address)
+          : (tx.return_address || new Uint8Array(32)));
+        chunks.push(typeof tx.return_pubkey === 'string'
+          ? hexToBytes(tx.return_pubkey)
+          : (tx.return_pubkey || new Uint8Array(32)));
+      }
+
+      // source_asset_type (length-prefixed string)
+      const srcAsset = tx.source_asset_type || 'SAL';
+      const srcAssetBytes = new TextEncoder().encode(srcAsset);
+      chunks.push(encodeVarint(srcAssetBytes.length));
+      chunks.push(srcAssetBytes);
+
+      // destination_asset_type (length-prefixed string)
+      const dstAsset = tx.destination_asset_type || 'SAL';
+      const dstAssetBytes = new TextEncoder().encode(dstAsset);
+      chunks.push(encodeVarint(dstAssetBytes.length));
+      chunks.push(dstAssetBytes);
+
+      // amount_slippage_limit
+      chunks.push(encodeVarint(tx.amount_slippage_limit ?? 0n));
+    }
+  }
+
   return concatBytes(chunks);
 }
 
@@ -1111,12 +1148,24 @@ export function getTxPrefixHash(tx) {
   }
 
   // Adapt vin/vout format to inputs/outputs if needed
+  // Include all Salvium-specific fields for correct hash
   const prefixForSerialization = {
     version: tx.version,
     unlockTime: tx.unlockTime,
     inputs: tx.inputs || tx.vin,
     outputs: tx.outputs || tx.vout,
-    extra: tx.extra
+    extra: tx.extra,
+    // Salvium-specific fields
+    txType: tx.txType,
+    amount_burnt: tx.amount_burnt,
+    return_address: tx.return_address,
+    return_address_list: tx.return_address_list,
+    return_address_change_mask: tx.return_address_change_mask,
+    return_pubkey: tx.return_pubkey,
+    protocol_tx_data: tx.protocol_tx_data,
+    source_asset_type: tx.source_asset_type,
+    destination_asset_type: tx.destination_asset_type,
+    amount_slippage_limit: tx.amount_slippage_limit
   };
 
   return keccak256(serializeTxPrefix(prefixForSerialization));
@@ -2865,12 +2914,28 @@ export function selectUTXOs(utxos, targetAmount, feePerInput, options = {}) {
  */
 export function buildTransaction(params, options = {}) {
   const { inputs, destinations, changeAddress, fee } = params;
-  const { unlockTime = 0, txSecretKey: providedTxSecKey, useCarrot = false } = options;
+  const {
+    unlockTime = 0,
+    txSecretKey: providedTxSecKey,
+    useCarrot = false,
+    // Salvium-specific options
+    txType = TX_TYPE.TRANSFER,
+    amountBurnt = 0n,
+    sourceAssetType = 'SAL',
+    destinationAssetType = 'SAL',
+    returnAddress = null,
+    returnPubkey = null,
+    protocolTxData = null,
+    amountSlippageLimit = 0n
+  } = options;
 
   if (!inputs || inputs.length === 0) {
     throw new Error('At least one input is required');
   }
-  if (!destinations || destinations.length === 0) {
+  // STAKE and BURN transactions can have no payment destinations (only change)
+  // The "burned" amount goes to amount_burnt field, not to outputs
+  if ((!destinations || destinations.length === 0) &&
+      txType !== TX_TYPE.STAKE && txType !== TX_TYPE.BURN) {
     throw new Error('At least one destination is required');
   }
 
@@ -2978,7 +3043,16 @@ export function buildTransaction(params, options = {}) {
     })),
     extra: {
       txPubKey: getTxPublicKey(txSecretKey)
-    }
+    },
+    // Salvium-specific prefix fields
+    txType,
+    amount_burnt: amountBurnt,
+    source_asset_type: sourceAssetType,
+    destination_asset_type: destinationAssetType,
+    return_address: returnAddress,
+    return_pubkey: returnPubkey,
+    protocol_tx_data: protocolTxData,
+    amount_slippage_limit: amountSlippageLimit
   };
 
   // Calculate transaction prefix hash
@@ -3071,6 +3145,120 @@ export function buildTransaction(params, options = {}) {
   };
 
   return transaction;
+}
+
+/**
+ * Build a STAKE transaction (Salvium-specific)
+ *
+ * STAKE transactions lock funds for STAKE_LOCK_PERIOD blocks and earn yield.
+ * Key differences from regular transfers:
+ * - Funds go to own address (self-send with lock)
+ * - amount_burnt contains the staked amount
+ * - Only change output (no payment destination)
+ * - unlock_time = STAKE_LOCK_PERIOD
+ *
+ * @param {Object} params - Transaction parameters
+ * @param {Array<Object>} params.inputs - Inputs to spend
+ * @param {bigint} params.stakeAmount - Amount to stake
+ * @param {Object} params.returnAddress - Address to receive stake back (usually own address)
+ *   - viewPublicKey, spendPublicKey, isSubaddress
+ * @param {bigint} params.fee - Transaction fee
+ * @param {Object} options - Additional options
+ * @param {number} options.stakeLockPeriod - Lock period in blocks (default: 21600 mainnet)
+ * @param {string} options.assetType - Asset type to stake ('SAL' or 'SAL1')
+ * @param {Uint8Array} options.txSecretKey - Pre-generated tx secret key
+ * @param {boolean} options.useCarrot - Use CARROT protocol (affects protocol_tx_data)
+ * @returns {Object} Complete STAKE transaction ready for broadcast
+ */
+export function buildStakeTransaction(params, options = {}) {
+  const { inputs, stakeAmount, returnAddress, fee } = params;
+  const {
+    stakeLockPeriod = 21600, // Mainnet default
+    assetType = 'SAL',
+    txSecretKey,
+    useCarrot = false
+  } = options;
+
+  if (!inputs || inputs.length === 0) {
+    throw new Error('At least one input is required');
+  }
+  if (!stakeAmount || stakeAmount <= 0n) {
+    throw new Error('Stake amount must be positive');
+  }
+  if (!returnAddress) {
+    throw new Error('Return address is required for stake transaction');
+  }
+
+  const stakeAmountBig = typeof stakeAmount === 'bigint' ? stakeAmount : BigInt(stakeAmount);
+  const feeBig = typeof fee === 'bigint' ? fee : BigInt(fee);
+
+  // Calculate total input amount
+  let totalInputAmount = 0n;
+  for (const input of inputs) {
+    const amount = typeof input.amount === 'bigint' ? input.amount : BigInt(input.amount);
+    totalInputAmount += amount;
+  }
+
+  // For STAKE: staked amount goes in amount_burnt, only change output
+  const changeAmount = totalInputAmount - stakeAmountBig - feeBig;
+  if (changeAmount < 0n) {
+    throw new Error(`Insufficient funds: inputs=${totalInputAmount}, stake=${stakeAmountBig}, fee=${feeBig}`);
+  }
+
+  // Create dummy destination (STAKE has no real destination - amount goes to amount_burnt)
+  // But we need at least one output (change) for the ring signature
+  const destinations = [];
+
+  // Prepare protocol_tx_data for CARROT STAKE (version >= 4)
+  let protocolTxData = null;
+  let returnAddressBytes = null;
+  let returnPubkeyBytes = null;
+
+  if (useCarrot) {
+    // CARROT STAKE uses protocol_tx_data structure
+    protocolTxData = {
+      version: 1,
+      return_address: typeof returnAddress.onetimeAddress === 'string'
+        ? hexToBytes(returnAddress.onetimeAddress)
+        : (returnAddress.onetimeAddress || new Uint8Array(32)),
+      return_pubkey: typeof returnAddress.spendPublicKey === 'string'
+        ? hexToBytes(returnAddress.spendPublicKey)
+        : returnAddress.spendPublicKey,
+      return_view_tag: returnAddress.viewTag || new Uint8Array(3),
+      return_anchor_enc: returnAddress.anchorEnc || new Uint8Array(16)
+    };
+  } else {
+    // Legacy STAKE uses return_address and return_pubkey
+    returnAddressBytes = typeof returnAddress.spendPublicKey === 'string'
+      ? hexToBytes(returnAddress.spendPublicKey)
+      : returnAddress.spendPublicKey;
+    returnPubkeyBytes = typeof returnAddress.viewPublicKey === 'string'
+      ? hexToBytes(returnAddress.viewPublicKey)
+      : returnAddress.viewPublicKey;
+  }
+
+  // Build using base buildTransaction with STAKE options
+  return buildTransaction(
+    {
+      inputs,
+      destinations,  // Empty - STAKE has no payment destinations
+      changeAddress: returnAddress,  // Change goes back to staker
+      fee
+    },
+    {
+      unlockTime: stakeLockPeriod,
+      txSecretKey,
+      useCarrot,
+      txType: TX_TYPE.STAKE,
+      amountBurnt: stakeAmountBig,
+      sourceAssetType: assetType,
+      destinationAssetType: assetType,
+      returnAddress: returnAddressBytes,
+      returnPubkey: returnPubkeyBytes,
+      protocolTxData,
+      amountSlippageLimit: 0n
+    }
+  );
 }
 
 /**
@@ -3479,8 +3667,17 @@ export function parseTransaction(data) {
       const height = Number(readVarint());
       vin.push({ type: TXIN_TYPE.GEN, height });
     } else if (inputType === TXIN_TYPE.KEY) {
-      // Key input
+      // Key input (Salvium format includes asset_type)
       const amount = readVarint();
+
+      // Salvium-specific: read asset_type string (length-prefixed)
+      const assetTypeLen = Number(readVarint());
+      let assetType = '';
+      if (assetTypeLen > 0) {
+        const assetTypeBytes = readBytes(assetTypeLen);
+        assetType = new TextDecoder().decode(assetTypeBytes);
+      }
+
       const keyOffsetCount = Number(readVarint());
       const keyOffsets = [];
       for (let j = 0; j < keyOffsetCount; j++) {
@@ -3490,6 +3687,7 @@ export function parseTransaction(data) {
       vin.push({
         type: TXIN_TYPE.KEY,
         amount,
+        assetType,
         keyOffsets,
         keyImage
       });
@@ -3507,20 +3705,71 @@ export function parseTransaction(data) {
     const outputType = data[offset++];
 
     if (outputType === TXOUT_TYPE.KEY) {
+      // Salvium txout_to_key: key + asset_type + unlock_time
       const key = readBytes(32);
+
+      // Salvium-specific: read asset_type string
+      const assetTypeLen = Number(readVarint());
+      let assetType = '';
+      if (assetTypeLen > 0) {
+        const assetTypeBytes = readBytes(assetTypeLen);
+        assetType = new TextDecoder().decode(assetTypeBytes);
+      }
+
+      const outputUnlockTime = Number(readVarint());
+
       vout.push({
         type: TXOUT_TYPE.KEY,
         amount,
-        key
+        key,
+        assetType,
+        unlockTime: outputUnlockTime
       });
     } else if (outputType === TXOUT_TYPE.TAGGED_KEY) {
+      // Salvium txout_to_tagged_key: key + asset_type + unlock_time + view_tag
       const key = readBytes(32);
+
+      // Salvium-specific: read asset_type string
+      const assetTypeLen = Number(readVarint());
+      let assetType = '';
+      if (assetTypeLen > 0) {
+        const assetTypeBytes = readBytes(assetTypeLen);
+        assetType = new TextDecoder().decode(assetTypeBytes);
+      }
+
+      const outputUnlockTime = Number(readVarint());
       const viewTag = data[offset++];
+
       vout.push({
         type: TXOUT_TYPE.TAGGED_KEY,
         amount,
         key,
+        assetType,
+        unlockTime: outputUnlockTime,
         viewTag
+      });
+    } else if (outputType === 0x04) {
+      // Salvium txout_to_carrot_v1: key + asset_type + view_tag(3) + encrypted_janus_anchor(16)
+      const key = readBytes(32);
+
+      // Salvium-specific: read asset_type string
+      const assetTypeLen = Number(readVarint());
+      let assetType = '';
+      if (assetTypeLen > 0) {
+        const assetTypeBytes = readBytes(assetTypeLen);
+        assetType = new TextDecoder().decode(assetTypeBytes);
+      }
+
+      const viewTag = readBytes(3);  // carrot view_tag is 3 bytes
+      const encryptedJanusAnchor = readBytes(16);  // janus anchor is 16 bytes
+
+      vout.push({
+        type: 0x04,  // CARROT_V1
+        amount,
+        key,
+        assetType,
+        viewTag,
+        encryptedJanusAnchor
       });
     } else {
       throw new Error(`Unknown output type: ${outputType}`);
@@ -3532,23 +3781,104 @@ export function parseTransaction(data) {
   const extraBytes = readBytes(extraSize);
   const extra = parseExtra(extraBytes);
 
+  // Salvium-specific transaction prefix fields (cryptonote_basic.h lines 249-280)
+  const txType = Number(readVarint());
+
+  let amount_burnt = 0n;
+  let return_address = null;
+  let return_address_list = null;
+  let return_address_change_mask = null;
+  let return_pubkey = null;
+  let source_asset_type = '';
+  let destination_asset_type = '';
+  let amount_slippage_limit = 0n;
+  let protocol_tx_data = null;
+
+  // TX_TYPE: see TX_TYPE constant
+  if (txType !== TX_TYPE.UNSET && txType !== TX_TYPE.PROTOCOL) {
+    // type != UNSET && type != PROTOCOL
+    amount_burnt = readVarint();
+
+    if (txType !== TX_TYPE.MINER) {
+      // type != MINER
+      if (txType === TX_TYPE.TRANSFER && version >= 3) {
+        // TRANSFER with version >= TRANSACTION_VERSION_N_OUTS (3)
+        const returnListCount = Number(readVarint());
+        return_address_list = [];
+        for (let i = 0; i < returnListCount; i++) {
+          return_address_list.push(readBytes(32));
+        }
+        const changeMaskCount = Number(readVarint());
+        return_address_change_mask = readBytes(changeMaskCount);
+      } else if (txType === TX_TYPE.STAKE && version >= 4) {
+        // STAKE with version >= TRANSACTION_VERSION_CARROT (4)
+        // protocol_tx_data_t has: version(varint), return_address(32), return_pubkey(32), return_view_tag(3), return_anchor_enc(16)
+        protocol_tx_data = {
+          version: Number(readVarint()),
+          return_address: readBytes(32),
+          return_pubkey: readBytes(32),
+          return_view_tag: readBytes(3),
+          return_anchor_enc: readBytes(16)
+        };
+      } else {
+        return_address = readBytes(32);
+        return_pubkey = readBytes(32);
+      }
+
+      // source_asset_type (string)
+      const srcTypeLen = Number(readVarint());
+      if (srcTypeLen > 0) {
+        source_asset_type = new TextDecoder().decode(readBytes(srcTypeLen));
+      }
+
+      // destination_asset_type (string)
+      const dstTypeLen = Number(readVarint());
+      if (dstTypeLen > 0) {
+        destination_asset_type = new TextDecoder().decode(readBytes(dstTypeLen));
+      }
+
+      amount_slippage_limit = readVarint();
+    }
+  }
+
   const prefix = {
     version,
     unlockTime,
     vin,
     vout,
-    extra
+    extra,
+    // Salvium-specific
+    txType,
+    amount_burnt,
+    return_address,
+    return_address_list,
+    return_address_change_mask,
+    return_pubkey,
+    source_asset_type,
+    destination_asset_type,
+    amount_slippage_limit,
+    protocol_tx_data
   };
 
   // For v1 transactions, we're done
   if (version === 1) {
-    return { prefix };
+    return { prefix, _bytesRead: offset };
   }
 
-  // Parse RingCT signature for v2+ transactions
-  const rct = parseRingCtSignature(data, offset, vin.length, vout.length);
+  // Track prefix end offset for _bytesRead calculation
+  const prefixEndOffset = offset;
 
-  return { prefix, rct };
+  // Get mixin from first input (needed for CLSAG parsing)
+  const mixin = vin.length > 0 && vin[0].keyOffsets ? vin[0].keyOffsets.length - 1 : 15;
+
+  // Parse RingCT signature for v2+ transactions
+  const rct = parseRingCtSignature(data, offset, vin.length, vout.length, mixin);
+
+  // Use actual end offset from RCT parsing for accurate _bytesRead
+  const rctEndOffset = rct._endOffset || (prefixEndOffset + 1); // fallback to prefix + 1 byte for Null type
+  delete rct._endOffset; // Clean up internal field
+
+  return { prefix, rct, _bytesRead: rctEndOffset };
 }
 
 /**
@@ -3661,15 +3991,146 @@ function parseExtraNonce(nonce) {
 }
 
 /**
- * Parse RingCT signature data
+ * Parse RingCT signature data (Salvium format)
+ *
+ * Salvium RCT format differs from Monero:
+ * 1. Header byte (not RCT type)
+ * 2. Salvium-specific data
+ * 3. Asset type strings (length-prefixed, "SAL" or "SAL1")
+ * 4. Separator byte (0x00)
+ * 5. Actual RCT type
+ * 6. Fee varint
+ * 7. ecdhInfo
+ * 8. outPk
+ * 9. p_r (Salvium-specific, 32 bytes)
+ * 10. Prunable data (bulletproofs, CLSAGs, pseudoOuts)
  *
  * @param {Uint8Array} data - Full transaction data
- * @param {number} offset - Starting offset for RCT data
+ * @param {number} startOffset - Starting offset for RCT data
  * @param {number} inputCount - Number of inputs
  * @param {number} outputCount - Number of outputs
+ * @param {number} mixin - Ring size minus 1 (from first input's key_offsets.length - 1)
  * @returns {Object} Parsed RingCT signature
  */
-function parseRingCtSignature(data, startOffset, inputCount, outputCount) {
+function parseRingCtSignature(data, startOffset, inputCount, outputCount, mixin = 15) {
+  let offset = startOffset;
+
+  const readBytes = (count) => {
+    if (offset + count > data.length) {
+      throw new Error(`Unexpected end of RCT data at offset ${offset}`);
+    }
+    const result = data.slice(offset, offset + count);
+    offset += count;
+    return result;
+  };
+
+  const readVarint = () => {
+    const { value, bytesRead } = decodeVarint(data, offset);
+    offset += bytesRead;
+    return value;
+  };
+
+  // Salvium RCT format (rctTypes.h lines 430-489):
+  // 1. type (1 byte)
+  // 2. txnFee (varint) - if type != Null
+  // 3. ecdhInfo (8 bytes per output for BulletproofPlus types)
+  // 4. outPk (32 bytes per output - mask only)
+  // 5. p_r (32 bytes)
+  // 6. salvium_data - only for SalviumZero/SalviumOne types
+
+  // RCT type
+  const type = data[offset++];
+
+  if (type === RCT_TYPE.Null) {
+    return { type, _endOffset: offset };
+  }
+
+  // Valid types for Salvium
+  const validTypes = [
+    RCT_TYPE.BulletproofPlus,  // 6
+    RCT_TYPE.FullProofs,       // 7
+    RCT_TYPE.SalviumZero,      // 8
+    RCT_TYPE.SalviumOne        // 9
+  ];
+
+  if (!validTypes.includes(type)) {
+    throw new Error(`Invalid RCT type: ${type} at offset ${offset - 1}`);
+  }
+
+  // Fee
+  const fee = readVarint();
+
+  // ECDH info (encrypted amounts) - 8 bytes per output for BulletproofPlus types
+  const ecdhInfo = [];
+  for (let i = 0; i < outputCount; i++) {
+    ecdhInfo.push({ amount: readBytes(8) });
+  }
+
+  // Output commitments (outPk) - 32 bytes per output
+  const outPk = [];
+  for (let i = 0; i < outputCount; i++) {
+    outPk.push(readBytes(32));
+  }
+
+  // p_r - Salvium-specific field (32 bytes)
+  const p_r = readBytes(32);
+
+  const rct = {
+    type,
+    txnFee: fee,
+    ecdhInfo,
+    outPk,
+    p_r
+  };
+
+  // Parse salvium_data based on type (matches Salvium rctTypes.h lines 486-494)
+  // Note: salvium_data parsing is optional for wallet scanning - we have enough
+  // info from outPk/ecdhInfo for output detection
+  try {
+    if (type === RCT_TYPE.SalviumZero || type === RCT_TYPE.SalviumOne) {
+      // Full salvium_data_t
+      rct.salvium_data = parseSalviumData(data, offset, true);
+      offset = rct.salvium_data._endOffset;
+      delete rct.salvium_data._endOffset;
+    } else if (type === RCT_TYPE.FullProofs) {
+      // Only pr_proof and sa_proof (2 x zk_proof = 2 x 96 bytes)
+      rct.salvium_data = {
+        pr_proof: parseZkProof(data, offset),
+        sa_proof: parseZkProof(data, offset + 96)
+      };
+      offset += 192;
+    }
+  } catch (e) {
+    // If salvium_data parsing fails, we can still use the transaction for scanning
+    // Just mark it as having a parse error and skip the prunable section
+    rct.salvium_data_parse_error = e.message;
+    rct._endOffset = offset;
+    return rct; // Return early with what we have
+  }
+
+  // Parse prunable data (bulletproofs + CLSAGs) with bounds checking
+  // The prunable section follows the base section
+  if (offset < data.length && type !== RCT_TYPE.Null) {
+    const prunable = parseRctSigPrunable(data, offset, type, inputCount, outputCount, mixin);
+    if (prunable) {
+      rct.bulletproofPlus = prunable.bulletproofPlus;
+      rct.CLSAGs = prunable.CLSAGs;
+      rct.TCLSAGs = prunable.TCLSAGs;
+      rct.pseudoOuts = prunable.pseudoOuts;
+      if (prunable._endOffset) {
+        offset = prunable._endOffset;
+      }
+    }
+  }
+
+  rct._endOffset = offset;
+  return rct;
+}
+
+/**
+ * Parse RingCT signature data (Monero format - for compatibility)
+ */
+function parseRingCtSignatureMonero(data, startOffset, inputCount, outputCount) {
   let offset = startOffset;
 
   const readBytes = (count) => {
@@ -3709,10 +4170,8 @@ function parseRingCtSignature(data, startOffset, inputCount, outputCount) {
   const ecdhInfo = [];
   for (let i = 0; i < outputCount; i++) {
     if (type >= RCT_TYPE.Bulletproof2) {
-      // Compact format: 8 bytes
-      ecdhInfo.push(readBytes(8));
+      ecdhInfo.push({ amount: readBytes(8) });
     } else {
-      // Full format: mask (32) + amount (32)
       ecdhInfo.push({
         mask: readBytes(32),
         amount: readBytes(32)
@@ -3726,36 +4185,241 @@ function parseRingCtSignature(data, startOffset, inputCount, outputCount) {
     outPk.push(readBytes(32));
   }
 
-  const rct = {
+  return {
     type,
-    fee,
+    txnFee: fee,
     pseudoOuts,
     ecdhInfo,
     outPk
   };
+}
 
-  // Parse range proofs based on type
-  if (type === RCT_TYPE.Bulletproof || type === RCT_TYPE.Bulletproof2) {
-    rct.bulletproofs = parseBulletproofs(data, offset);
-    offset = rct.bulletproofs._endOffset;
-    delete rct.bulletproofs._endOffset;
-  } else if (type === RCT_TYPE.BulletproofPlus || type === RCT_TYPE.CLSAG) {
-    rct.bulletproofPlus = parseBulletproofPlus(data, offset, outputCount);
-    offset = rct.bulletproofPlus._endOffset;
-    delete rct.bulletproofPlus._endOffset;
+/**
+ * Parse zk_proof structure (R, z1, z2 - 3 x 32 bytes = 96 bytes)
+ * Matches Salvium rctTypes.h lines 94-103
+ */
+function parseZkProof(data, offset) {
+  return {
+    R: data.slice(offset, offset + 32),
+    z1: data.slice(offset + 32, offset + 64),
+    z2: data.slice(offset + 64, offset + 96)
+  };
+}
+
+/**
+ * Parse salvium_data_t structure
+ * Matches Salvium rctTypes.h lines 390-412
+ */
+function parseSalviumData(data, startOffset, full = true) {
+  let offset = startOffset;
+
+  const readVarint = () => {
+    const { value, bytesRead } = decodeVarint(data, offset);
+    offset += bytesRead;
+    return value;
+  };
+
+  const result = {};
+
+  // salvium_data_type (varint)
+  result.salvium_data_type = Number(readVarint());
+
+  // pr_proof (zk_proof = 96 bytes)
+  result.pr_proof = parseZkProof(data, offset);
+  offset += 96;
+
+  // sa_proof (zk_proof = 96 bytes)
+  result.sa_proof = parseZkProof(data, offset);
+  offset += 96;
+
+  // SalviumZeroAudit (type 1) has additional fields
+  if (result.salvium_data_type === 1) {
+    // cz_proof (zk_proof = 96 bytes)
+    result.cz_proof = parseZkProof(data, offset);
+    offset += 96;
+
+    // input_verification_data (vector of salvium_input_data_t)
+    const inputCount = Number(readVarint());
+    result.input_verification_data = [];
+    for (let i = 0; i < inputCount; i++) {
+      // salvium_input_data_t (per rctTypes.h lines 371-388):
+      // - aR: key_derivation (32 bytes)
+      // - amount: xmr_amount (VARINT_FIELD)
+      // - i: size_t (VARINT_FIELD)
+      // - origin_tx_type: uint8_t (VARINT_FIELD)
+      // - if origin_tx_type != UNSET:
+      //   - aR_stake: key_derivation (FIELD = 32 bytes)
+      //   - i_stake: size_t (FIELD = 8 bytes little-endian, NOT varint!)
+      const aR = data.slice(offset, offset + 32);
+      offset += 32;
+      const amount = readVarint();
+      const idx = Number(readVarint());
+      const origin_tx_type = Number(readVarint());
+
+      const inputData = { aR, amount, i: idx, origin_tx_type };
+
+      // Per Salvium source: if (origin_tx_type != cryptonote::transaction_type::UNSET)
+      if (origin_tx_type !== 0) {
+        inputData.aR_stake = data.slice(offset, offset + 32);
+        offset += 32;
+        // i_stake uses FIELD() for size_t = 8 bytes little-endian uint64
+        inputData.i_stake = Number(
+          BigInt(data[offset]) |
+          (BigInt(data[offset + 1]) << 8n) |
+          (BigInt(data[offset + 2]) << 16n) |
+          (BigInt(data[offset + 3]) << 24n) |
+          (BigInt(data[offset + 4]) << 32n) |
+          (BigInt(data[offset + 5]) << 40n) |
+          (BigInt(data[offset + 6]) << 48n) |
+          (BigInt(data[offset + 7]) << 56n)
+        );
+        offset += 8;
+      }
+
+      result.input_verification_data.push(inputData);
+    }
+
+    // spend_pubkey (32 bytes)
+    result.spend_pubkey = data.slice(offset, offset + 32);
+    offset += 32;
+
+    // enc_view_privkey_str (length-prefixed string)
+    const strLen = Number(readVarint());
+    result.enc_view_privkey_str = new TextDecoder().decode(data.slice(offset, offset + strLen));
+    offset += strLen;
   }
 
-  // Parse CLSAG signatures
-  if (type === RCT_TYPE.CLSAG || type === RCT_TYPE.BulletproofPlus) {
-    rct.CLSAGs = [];
-    for (let i = 0; i < inputCount; i++) {
-      const clsag = parseCLSAG(data, offset, inputCount);
-      rct.CLSAGs.push(clsag.sig);
-      offset = clsag.endOffset;
+  result._endOffset = offset;
+  return result;
+}
+
+/**
+ * Parse RCT prunable section (bulletproofs + CLSAGs/TCLSAGs + pseudoOuts)
+ * Matches Salvium rctTypes.h lines 518-679
+ *
+ * @param {number} mixin - Ring size minus 1 (CLSAG s array has mixin+1 elements with NO size prefix)
+ */
+function parseRctSigPrunable(data, startOffset, type, inputCount, outputCount, mixin) {
+  let offset = startOffset;
+
+  // Bounds check helper
+  const canRead = (count) => offset + count <= data.length;
+
+  const readBytes = (count) => {
+    if (!canRead(count)) return null;
+    const result = data.slice(offset, offset + count);
+    offset += count;
+    return result;
+  };
+
+  const readVarint = () => {
+    if (offset >= data.length) return null;
+    const { value, bytesRead } = decodeVarint(data, offset);
+    offset += bytesRead;
+    return value;
+  };
+
+  const result = {};
+
+  // For BulletproofPlus types (6, 7, 8, 9), parse BulletproofPlus
+  if (type >= RCT_TYPE.BulletproofPlus) {
+    const nbp = readVarint();
+    if (nbp === null || nbp > 1000) return null; // Sanity check
+
+    result.bulletproofPlus = [];
+    for (let i = 0; i < nbp; i++) {
+      const A = readBytes(32);
+      const A1 = readBytes(32);
+      const B = readBytes(32);
+      const r1 = readBytes(32);
+      const s1 = readBytes(32);
+      const d1 = readBytes(32);
+
+      if (!d1) return null; // Ran out of data
+
+      // L array
+      const Lcount = readVarint();
+      if (Lcount === null || Lcount > 64) return null; // Sanity check (log2(2^64) = 64 max)
+      const L = [];
+      for (let j = 0; j < Lcount; j++) {
+        const key = readBytes(32);
+        if (!key) return null;
+        L.push(key);
+      }
+
+      // R array (same size as L)
+      const R = [];
+      for (let j = 0; j < Lcount; j++) {
+        const key = readBytes(32);
+        if (!key) return null;
+        R.push(key);
+      }
+
+      result.bulletproofPlus.push({ A, A1, B, r1, s1, d1, L, R });
     }
   }
 
-  return rct;
+  // Parse CLSAGs or TCLSAGs based on type
+  // Note: s/sx/sy arrays have NO size prefix - size is mixin + 1
+  const ringSize = mixin + 1;
+
+  if (type === RCT_TYPE.SalviumOne) {
+    // TCLSAGs (Twin CLSAG) - has sx and sy arrays (Salvium rctTypes.h lines 560-612)
+    result.TCLSAGs = [];
+    for (let i = 0; i < inputCount; i++) {
+      // sx array: mixin + 1 elements, NO size prefix
+      const sx = [];
+      for (let j = 0; j < ringSize; j++) {
+        const key = readBytes(32);
+        if (!key) return null;
+        sx.push(key);
+      }
+
+      // sy array: mixin + 1 elements, NO size prefix
+      const sy = [];
+      for (let j = 0; j < ringSize; j++) {
+        const key = readBytes(32);
+        if (!key) return null;
+        sy.push(key);
+      }
+
+      const c1 = readBytes(32);
+      const D = readBytes(32);
+      if (!D) return null;
+
+      result.TCLSAGs.push({ sx, sy, c1, D });
+    }
+  } else if (type >= RCT_TYPE.CLSAG) {
+    // CLSAGs (Salvium rctTypes.h lines 613-652)
+    result.CLSAGs = [];
+    for (let i = 0; i < inputCount; i++) {
+      // s array: mixin + 1 elements, NO size prefix
+      const s = [];
+      for (let j = 0; j < ringSize; j++) {
+        const key = readBytes(32);
+        if (!key) return null;
+        s.push(key);
+      }
+
+      const c1 = readBytes(32);
+      const D = readBytes(32);
+      if (!D) return null;
+
+      result.CLSAGs.push({ s, c1, D });
+    }
+  }
+
+  // pseudoOuts (for types that have them in prunable)
+  if (type >= RCT_TYPE.BulletproofPlus) {
+    result.pseudoOuts = [];
+    for (let i = 0; i < inputCount; i++) {
+      const key = readBytes(32);
+      if (!key) return null;
+      result.pseudoOuts.push(key);
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -4019,4 +4683,337 @@ export function summarizeTransaction(tx) {
     outputKeys: prefix.vout.map(v => v.key),
     commitments: tx.rct?.outPk || []
   };
+}
+
+// =============================================================================
+// BLOCK PARSING
+// =============================================================================
+
+/**
+ * Parse a Salvium pricing_record from binary data
+ *
+ * Structure (from oracle/pricing_record.h):
+ * - pr_version: varint
+ * - height: varint
+ * - supply: { sal: varint, vsd: varint }
+ * - assets: vector of { asset_type: string, spot_price: varint, ma_price: varint }
+ * - timestamp: varint
+ * - signature: vector of bytes
+ *
+ * @param {Uint8Array} data - Raw binary data
+ * @param {number} [startOffset=0] - Starting offset in data
+ * @returns {{ record: Object, bytesRead: number }} Parsed pricing record and bytes consumed
+ */
+export function parsePricingRecord(data, startOffset = 0) {
+  let offset = startOffset;
+
+  const readBytes = (count) => {
+    if (offset + count > data.length) {
+      throw new Error(`Unexpected end of data reading ${count} bytes at offset ${offset}`);
+    }
+    const bytes = data.slice(offset, offset + count);
+    offset += count;
+    return bytes;
+  };
+
+  const readVarint = () => {
+    let result = 0n;
+    let shift = 0n;
+    while (offset < data.length) {
+      const byte = data[offset++];
+      result |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) break;
+      shift += 7n;
+    }
+    return result;
+  };
+
+  const readString = () => {
+    const len = Number(readVarint());
+    if (len === 0) return '';
+    const bytes = readBytes(len);
+    return new TextDecoder().decode(bytes);
+  };
+
+  // pr_version
+  const prVersion = Number(readVarint());
+
+  // height
+  const height = Number(readVarint());
+
+  // supply_data { sal, vsd }
+  const supply = {
+    sal: readVarint(),
+    vsd: readVarint()
+  };
+
+  // assets vector
+  const assetsCount = Number(readVarint());
+  const assets = [];
+  for (let i = 0; i < assetsCount; i++) {
+    assets.push({
+      assetType: readString(),
+      spotPrice: readVarint(),
+      maPrice: readVarint()
+    });
+  }
+
+  // timestamp
+  const timestamp = Number(readVarint());
+
+  // signature (vector of bytes)
+  const signatureLen = Number(readVarint());
+  const signature = signatureLen > 0 ? readBytes(signatureLen) : new Uint8Array(0);
+
+  return {
+    record: {
+      prVersion,
+      height,
+      supply,
+      assets,
+      timestamp,
+      signature
+    },
+    bytesRead: offset - startOffset
+  };
+}
+
+/**
+ * Parse a Salvium block from binary data
+ *
+ * Structure (from cryptonote_basic/cryptonote_basic.h):
+ *
+ * block_header:
+ * - major_version: varint
+ * - minor_version: varint
+ * - timestamp: varint
+ * - prev_id: 32 bytes (hash)
+ * - nonce: 4 bytes (uint32 LE)
+ * - pricing_record: only if major_version >= HF_VERSION_ENABLE_ORACLE (255)
+ *
+ * block (extends block_header):
+ * - miner_tx: full transaction (coinbase)
+ * - protocol_tx: full transaction (Salvium-specific: conversions, yields, refunds)
+ * - tx_hashes: vector of 32-byte hashes
+ *
+ * @param {Uint8Array} data - Raw binary block data
+ * @returns {Object} Parsed block
+ */
+export function parseBlock(data) {
+  let offset = 0;
+
+  const readBytes = (count) => {
+    if (offset + count > data.length) {
+      throw new Error(`Unexpected end of data reading ${count} bytes at offset ${offset}`);
+    }
+    const bytes = data.slice(offset, offset + count);
+    offset += count;
+    return bytes;
+  };
+
+  const readVarint = () => {
+    let result = 0n;
+    let shift = 0n;
+    while (offset < data.length) {
+      const byte = data[offset++];
+      result |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) break;
+      shift += 7n;
+    }
+    return result;
+  };
+
+  const readUint32LE = () => {
+    const bytes = readBytes(4);
+    return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+  };
+
+  // ============================================
+  // BLOCK HEADER
+  // ============================================
+
+  const majorVersion = Number(readVarint());
+  const minorVersion = Number(readVarint());
+  const timestamp = Number(readVarint());
+  const prevId = readBytes(32);
+  const nonce = readUint32LE();
+
+  // Pricing record (only if major_version >= HF_VERSION_ENABLE_ORACLE)
+  let pricingRecord = null;
+  if (majorVersion >= HF_VERSION_ENABLE_ORACLE) {
+    const prResult = parsePricingRecord(data, offset);
+    pricingRecord = prResult.record;
+    offset += prResult.bytesRead;
+  }
+
+  // ============================================
+  // BLOCK BODY
+  // ============================================
+
+  // Parse miner_tx (coinbase transaction)
+  const minerTxData = data.slice(offset);
+  const minerTx = parseTransaction(minerTxData);
+  offset += minerTx._bytesRead || estimateTransactionSize(minerTxData);
+
+  // Parse protocol_tx (Salvium-specific transaction)
+  const protocolTxData = data.slice(offset);
+  const protocolTx = parseTransaction(protocolTxData);
+  offset += protocolTx._bytesRead || estimateTransactionSize(protocolTxData);
+
+  // Parse tx_hashes vector
+  const txHashCount = Number(readVarint());
+  const txHashes = [];
+  for (let i = 0; i < txHashCount; i++) {
+    txHashes.push(readBytes(32));
+  }
+
+  return {
+    header: {
+      majorVersion,
+      minorVersion,
+      timestamp,
+      prevId,
+      nonce,
+      pricingRecord
+    },
+    minerTx,
+    protocolTx,
+    txHashes,
+    _bytesRead: offset
+  };
+}
+
+/**
+ * Estimate transaction size by parsing it (internal helper)
+ * This is needed because parseTransaction doesn't return bytes read
+ *
+ * @param {Uint8Array} data - Transaction data
+ * @returns {number} Estimated bytes consumed
+ * @private
+ */
+function estimateTransactionSize(data) {
+  // Parse the transaction and track how many bytes were consumed
+  // This is a simplified re-parse just for size calculation
+  let offset = 0;
+
+  const readVarint = () => {
+    let result = 0n;
+    let shift = 0n;
+    while (offset < data.length) {
+      const byte = data[offset++];
+      result |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) break;
+      shift += 7n;
+    }
+    return result;
+  };
+
+  const readBytes = (count) => {
+    offset += count;
+    return data.slice(offset - count, offset);
+  };
+
+  // Version
+  const version = Number(readVarint());
+  // Unlock time
+  readVarint();
+
+  // Inputs
+  const vinCount = Number(readVarint());
+  for (let i = 0; i < vinCount; i++) {
+    const type = data[offset++];
+    if (type === 0xff) {
+      // txin_gen
+      readVarint();
+    } else if (type === 0x02) {
+      // txin_to_key
+      readVarint(); // amount
+      const assetTypeLen = Number(readVarint());
+      if (assetTypeLen > 0) readBytes(assetTypeLen);
+      const keyOffsetCount = Number(readVarint());
+      for (let j = 0; j < keyOffsetCount; j++) readVarint();
+      readBytes(32); // key image
+    }
+  }
+
+  // Outputs
+  const voutCount = Number(readVarint());
+  for (let i = 0; i < voutCount; i++) {
+    readVarint(); // amount
+    const type = data[offset++];
+    if (type === 0x02 || type === 0x03 || type === 0x04) {
+      readBytes(32); // key
+      const assetTypeLen = Number(readVarint());
+      if (assetTypeLen > 0) readBytes(assetTypeLen);
+      if (type === 0x03 || type === 0x04) {
+        readVarint(); // output_unlock_time
+        if (type === 0x04) {
+          readBytes(3); // view_tag
+        }
+      }
+    }
+  }
+
+  // Extra
+  const extraLen = Number(readVarint());
+  readBytes(extraLen);
+
+  // Transaction type and Salvium-specific fields (version >= 2)
+  if (version >= 2) {
+    const txType = Number(readVarint());
+
+    if (txType !== TX_TYPE.UNSET && txType !== TX_TYPE.PROTOCOL) {
+      readVarint(); // amount_burnt
+
+      if (txType !== TX_TYPE.MINER) {
+        if (txType === TX_TYPE.TRANSFER && version >= 3) {
+          const returnAddressLen = Number(readVarint());
+          if (returnAddressLen > 0) readBytes(returnAddressLen);
+        } else if (txType === TX_TYPE.STAKE && version >= 4) {
+          readBytes(32); // return_address
+          readBytes(32); // return_pubkey
+          readBytes(3);  // return_view_tag
+          readBytes(16); // return_anchor_enc
+        } else if (txType !== TX_TYPE.TRANSFER) {
+          readBytes(32); // return_address
+        }
+
+        const srcAssetLen = Number(readVarint());
+        if (srcAssetLen > 0) readBytes(srcAssetLen);
+        const dstAssetLen = Number(readVarint());
+        if (dstAssetLen > 0) readBytes(dstAssetLen);
+        readVarint(); // amount_slippage_limit
+      }
+    }
+
+    if (txType === TX_TYPE.PROTOCOL) {
+      readVarint(); // protocol_tx_data.version
+      readBytes(32); // return_address
+      readBytes(32); // return_pubkey
+      readBytes(3);  // return_view_tag
+      readBytes(16); // return_anchor_enc
+    }
+  }
+
+  // RCT signatures (if version >= 2 and not coinbase)
+  if (version >= 2 && vinCount > 0 && data[offset] !== undefined) {
+    const rctType = data[offset++];
+
+    if (rctType !== 0) {
+      // txnFee
+      readVarint();
+
+      // ecdhInfo (for non-coinbase)
+      for (let i = 0; i < voutCount; i++) {
+        readBytes(8); // amount (compact)
+      }
+
+      // outPk
+      for (let i = 0; i < voutCount; i++) {
+        readBytes(32);
+      }
+    }
+  }
+
+  return offset;
 }

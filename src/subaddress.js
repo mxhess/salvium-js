@@ -80,15 +80,16 @@ function uint32ToLE(value) {
  * @returns {Uint8Array} 32-byte subaddress secret key
  */
 export function cnSubaddressSecretKey(viewSecretKey, major, minor) {
-  // Domain separator: "SubAddr" (7 bytes, no null terminator in hash)
-  const domainSep = new TextEncoder().encode('SubAddr');
+  // Domain separator: "SubAddr\0" (8 bytes, INCLUDING null terminator)
+  // Salvium uses sizeof(HASH_KEY_SUBADDRESS) which includes the null byte
+  const domainSep = new Uint8Array([0x53, 0x75, 0x62, 0x41, 0x64, 0x64, 0x72, 0x00]); // "SubAddr\0"
 
-  // Build data: "SubAddr" || k_view || major_LE || minor_LE
-  const data = new Uint8Array(7 + 32 + 4 + 4);
+  // Build data: "SubAddr\0" || k_view || major_LE || minor_LE
+  const data = new Uint8Array(8 + 32 + 4 + 4);
   data.set(domainSep, 0);
-  data.set(viewSecretKey, 7);
-  data.set(uint32ToLE(major), 7 + 32);
-  data.set(uint32ToLE(minor), 7 + 32 + 4);
+  data.set(viewSecretKey, 8);
+  data.set(uint32ToLE(major), 8 + 32);
+  data.set(uint32ToLE(minor), 8 + 32 + 4);
 
   return hashToScalar(data);
 }
@@ -328,6 +329,107 @@ export function isValidPaymentId(paymentId) {
   return !allZeros;
 }
 
+// ============================================================================
+// Subaddress Map Generation (matches C++ wallet lookahead behavior)
+// ============================================================================
+
+/**
+ * Default lookahead values from Salvium C++ wallet
+ */
+export const SUBADDRESS_LOOKAHEAD_MAJOR = 50;
+export const SUBADDRESS_LOOKAHEAD_MINOR = 200;
+
+/**
+ * Convert bytes to hex string
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Generate CryptoNote subaddress lookup map
+ * Maps: spendPublicKey (hex) → {major, minor}
+ *
+ * @param {Uint8Array} spendPublicKey - Main spend public key
+ * @param {Uint8Array} viewSecretKey - View secret key
+ * @param {number} [majorLookahead=50] - Number of major indices
+ * @param {number} [minorLookahead=200] - Number of minor indices per major
+ * @returns {Map<string, {major: number, minor: number}>}
+ */
+export function generateCNSubaddressMap(spendPublicKey, viewSecretKey, majorLookahead = SUBADDRESS_LOOKAHEAD_MAJOR, minorLookahead = SUBADDRESS_LOOKAHEAD_MINOR) {
+  const map = new Map();
+
+  for (let major = 0; major <= majorLookahead; major++) {
+    for (let minor = 0; minor <= minorLookahead; minor++) {
+      const subaddr = cnSubaddress(spendPublicKey, viewSecretKey, major, minor);
+      const spendPubkeyHex = bytesToHex(subaddr.spendPublicKey);
+      map.set(spendPubkeyHex, { major, minor });
+    }
+  }
+
+  return map;
+}
+
+/**
+ * Generate CARROT subaddress lookup map
+ * Maps: spendPublicKey (hex) → {major, minor}
+ *
+ * @param {Uint8Array} accountSpendPubkey - K_s (account spend pubkey)
+ * @param {Uint8Array} accountViewPubkey - K_v = k_vi * K_s
+ * @param {Uint8Array} generateAddressSecret - s_ga
+ * @param {number} [majorLookahead=50] - Number of major indices
+ * @param {number} [minorLookahead=200] - Number of minor indices per major
+ * @returns {Map<string, {major: number, minor: number}>}
+ */
+export function generateCarrotSubaddressMap(accountSpendPubkey, accountViewPubkey, generateAddressSecret, majorLookahead = SUBADDRESS_LOOKAHEAD_MAJOR, minorLookahead = SUBADDRESS_LOOKAHEAD_MINOR) {
+  const map = new Map();
+
+  for (let major = 0; major <= majorLookahead; major++) {
+    for (let minor = 0; minor <= minorLookahead; minor++) {
+      const subaddr = carrotSubaddress(accountSpendPubkey, accountViewPubkey, generateAddressSecret, major, minor);
+      const spendPubkeyHex = bytesToHex(subaddr.spendPublicKey);
+      map.set(spendPubkeyHex, { major, minor });
+    }
+  }
+
+  return map;
+}
+
+/**
+ * Generate both CN and CARROT subaddress maps
+ * This matches the C++ wallet behavior of generating both derivation types
+ *
+ * @param {Object} keys - Wallet keys
+ * @param {Uint8Array} keys.spendPublicKey - CN main spend public key
+ * @param {Uint8Array} keys.viewSecretKey - CN view secret key
+ * @param {Uint8Array} keys.accountSpendPubkey - CARROT K_s
+ * @param {Uint8Array} keys.accountViewPubkey - CARROT K_v
+ * @param {Uint8Array} keys.generateAddressSecret - CARROT s_ga
+ * @param {number} [majorLookahead=50] - Number of major indices
+ * @param {number} [minorLookahead=200] - Number of minor indices per major
+ * @returns {Object} { cnSubaddresses: Map, carrotSubaddresses: Map }
+ */
+export function generateSubaddressMaps(keys, majorLookahead = SUBADDRESS_LOOKAHEAD_MAJOR, minorLookahead = SUBADDRESS_LOOKAHEAD_MINOR) {
+  const cnSubaddresses = generateCNSubaddressMap(
+    keys.spendPublicKey,
+    keys.viewSecretKey,
+    majorLookahead,
+    minorLookahead
+  );
+
+  const carrotSubaddresses = generateCarrotSubaddressMap(
+    keys.accountSpendPubkey,
+    keys.accountViewPubkey,
+    keys.generateAddressSecret,
+    majorLookahead,
+    minorLookahead
+  );
+
+  return { cnSubaddresses, carrotSubaddresses };
+}
+
 export default {
   // CryptoNote
   cnSubaddressSecretKey,
@@ -338,6 +440,13 @@ export default {
   carrotIndexExtensionGenerator,
   carrotSubaddressScalar,
   carrotSubaddress,
+
+  // Subaddress map generation
+  generateCNSubaddressMap,
+  generateCarrotSubaddressMap,
+  generateSubaddressMaps,
+  SUBADDRESS_LOOKAHEAD_MAJOR,
+  SUBADDRESS_LOOKAHEAD_MINOR,
 
   // Integrated address utilities
   generatePaymentId,

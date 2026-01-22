@@ -110,30 +110,43 @@ export function mnemonicToSeed(mnemonic, options = {}) {
   }
 
   // Verify checksum (word 25)
-  // Checksum = first N letters of each of first 24 words (N = prefixLength), concatenated, then CRC32
+  // Salvium checksum: CRC32 of prefixes → mod 24 → the checksum word should match seed[index]
   const checksumData = words.slice(0, 24).map(w => w.slice(0, prefixLength)).join('');
-  const expectedChecksum = crc32(checksumData) % WORD_LIST_SIZE;
+  const checksumIndex = crc32(checksumData) % 24;
 
-  if (indices[24] !== expectedChecksum) {
+  // The checksum word should match the word at checksumIndex (by prefix)
+  const expectedPrefix = words[checksumIndex].slice(0, prefixLength);
+  const actualPrefix = words[24].slice(0, prefixLength);
+
+  if (expectedPrefix !== actualPrefix) {
     return {
       valid: false,
       seed: null,
       language,
-      error: `Checksum mismatch: expected "${wordList[expectedChecksum]}", got "${words[24]}"`
+      error: `Checksum mismatch: expected "${words[checksumIndex]}", got "${words[24]}"`
     };
   }
 
   // Decode 24 words to 256-bit seed
-  // Each group of 3 words encodes 32 bits: val = w1 + w2*1626 + w3*1626^2
+  // Salvium uses modified base-1626 encoding with wrapping for error detection
+  // Formula: val = w1 + N * (((N - w1) + w2) % N) + N^2 * (((N - w2) + w3) % N)
   const seed = new Uint8Array(32);
+  const N = WORD_LIST_SIZE;
 
   for (let i = 0; i < 8; i++) {
     const w1 = indices[i * 3];
     const w2 = indices[i * 3 + 1];
     const w3 = indices[i * 3 + 2];
 
-    // Decode: val = w1 + w2*n + w3*n^2 where n=1626
-    let val = w1 + w2 * WORD_LIST_SIZE + w3 * WORD_LIST_SIZE * WORD_LIST_SIZE;
+    // Salvium/Monero electrum-style decoding with wrapping
+    const val = w1 +
+                N * (((N - w1) + w2) % N) +
+                N * N * (((N - w2) + w3) % N);
+
+    // Verify the encoding is valid (val % N should equal w1)
+    if (val % N !== w1) {
+      return { valid: false, seed: null, language, error: `Invalid word encoding at position ${i * 3 + 1}` };
+    }
 
     // Store as 4 little-endian bytes
     seed[i * 4] = val & 0xFF;
@@ -164,8 +177,11 @@ export function seedToMnemonic(seed, options = {}) {
 
   const { wordList, prefixLength } = resolved;
   const words = [];
+  const N = WORD_LIST_SIZE;
 
   // Encode each 4 bytes (32 bits) as 3 words
+  // Salvium uses modified base-1626 encoding with wrapping for error detection
+  // Formula: w1 = val % N, w2 = ((val/N) + w1) % N, w3 = ((val/N/N) + w2) % N
   for (let i = 0; i < 8; i++) {
     let val = seed[i * 4] |
               (seed[i * 4 + 1] << 8) |
@@ -175,19 +191,18 @@ export function seedToMnemonic(seed, options = {}) {
     // Convert to unsigned
     val = val >>> 0;
 
-    const w1 = val % WORD_LIST_SIZE;
-    val = Math.floor(val / WORD_LIST_SIZE);
-    const w2 = val % WORD_LIST_SIZE;
-    val = Math.floor(val / WORD_LIST_SIZE);
-    const w3 = val % WORD_LIST_SIZE;
+    const w1 = val % N;
+    const w2 = (Math.floor(val / N) + w1) % N;
+    const w3 = (Math.floor(val / N / N) + w2) % N;
 
     words.push(wordList[w1], wordList[w2], wordList[w3]);
   }
 
   // Calculate checksum word
+  // Salvium checksum: CRC32 of prefixes → mod 24 → repeat seed[index] as checksum
   const checksumData = words.map(w => w.slice(0, prefixLength)).join('');
-  const checksumIndex = crc32(checksumData) % WORD_LIST_SIZE;
-  words.push(wordList[checksumIndex]);
+  const checksumIndex = crc32(checksumData) % 24;
+  words.push(words[checksumIndex]);
 
   return words.join(' ');
 }

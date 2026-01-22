@@ -23,6 +23,7 @@ import { generateKeyDerivation, derivationToScalar, deriveSecretKey, scanTransac
 import { generateKeyImage } from './keyimage.js';
 import {
   buildTransaction,
+  buildStakeTransaction,
   signTransaction,
   prepareInputs,
   selectUTXOs,
@@ -32,6 +33,7 @@ import {
   UTXO_STRATEGY
 } from './transaction.js';
 import { NETWORK, ADDRESS_FORMAT } from './constants.js';
+import { getNetworkConfig } from './consensus.js';
 import { seedToMnemonic, mnemonicToSeed, validateMnemonic } from './mnemonic.js';
 
 // ============================================================================
@@ -1210,14 +1212,130 @@ export class Wallet {
 
   /**
    * Create a stake transaction (Salvium-specific)
-   * @param {bigint} amount - Amount to stake
+   *
+   * Stakes the specified amount for STAKE_LOCK_PERIOD blocks to earn yield.
+   * The staked amount is locked and returned via PROTOCOL transaction after maturity.
+   *
+   * @param {bigint|number|string} amount - Amount to stake (in atomic units)
    * @param {Object} options - Options
-   * @returns {Promise<Object>} Stake transaction
+   * @param {string} options.assetType - Asset type to stake ('SAL' or 'SAL1', default: 'SAL')
+   * @param {number} options.accountIndex - Account index (default: 0)
+   * @param {number} options.ringSize - Ring size for privacy (default: 16)
+   * @param {string} options.priority - Fee priority ('low', 'default', 'high')
+   * @param {Object} options.rpcClient - RPC client for fetching decoys
+   * @returns {Promise<Object>} Stake transaction ready for broadcast
    */
   async createStakeTransaction(amount, options = {}) {
-    // TODO: Implement stake transaction following Salvium spec
-    // This creates a TX_TYPE.STAKE transaction
-    throw new Error('Stake transactions not yet implemented');
+    if (!this.canSign()) {
+      throw new Error('Full wallet required to create stake transactions');
+    }
+
+    const {
+      assetType = 'SAL',
+      accountIndex = 0,
+      ringSize = 16,
+      priority = 'default',
+      rpcClient = null
+    } = options;
+
+    // Validate asset type
+    if (assetType !== 'SAL' && assetType !== 'SAL1') {
+      throw new Error('STAKE transactions must use SAL or SAL1 asset type');
+    }
+
+    // Convert amount to bigint
+    const stakeAmount = typeof amount === 'bigint' ? amount :
+                        typeof amount === 'string' ? BigInt(amount) : BigInt(Math.floor(amount));
+
+    if (stakeAmount <= 0n) {
+      throw new Error('Stake amount must be positive');
+    }
+
+    // Get network config for STAKE_LOCK_PERIOD
+    const networkConfig = getNetworkConfig(this.network);
+    const stakeLockPeriod = networkConfig.STAKE_LOCK_PERIOD;
+
+    // Estimate fee (STAKE tx has 1 input minimum, 1 output - change only)
+    const estimatedFee = estimateTransactionFee(
+      1, // inputs
+      1, // outputs (change only)
+      { priority, ringSize }
+    );
+
+    // Select UTXOs from specified account
+    const availableUTXOs = this.getUTXOs({
+      unlockedOnly: true,
+      accountIndex,
+      assetType
+    });
+
+    if (availableUTXOs.length === 0) {
+      throw new Error(`No unlocked ${assetType} outputs available for staking`);
+    }
+
+    // Select UTXOs to cover stake amount + fee
+    const { selected, changeAmount } = selectUTXOs(
+      availableUTXOs,
+      stakeAmount,
+      estimatedFee,
+      {
+        strategy: UTXO_STRATEGY.LARGEST_FIRST,
+        currentHeight: this._syncHeight,
+        dustThreshold: 1000000n
+      }
+    );
+
+    if (selected.length === 0) {
+      throw new Error(`Insufficient ${assetType} balance for stake of ${stakeAmount} + fee ${estimatedFee}`);
+    }
+
+    // Prepare inputs with ring members (decoys)
+    const preparedInputs = await prepareInputs(selected, rpcClient, { ringSize });
+
+    // Recalculate fee with actual input count
+    const actualFee = estimateTransactionFee(
+      preparedInputs.length,
+      1, // Only change output
+      { priority, ringSize }
+    );
+
+    // Return address is own address (stake returns to self)
+    const returnAddress = {
+      viewPublicKey: this._viewPublicKey,
+      spendPublicKey: this._spendPublicKey,
+      isSubaddress: false
+    };
+
+    // Build the stake transaction
+    const tx = buildStakeTransaction(
+      {
+        inputs: preparedInputs,
+        stakeAmount,
+        returnAddress,
+        fee: actualFee
+      },
+      {
+        stakeLockPeriod,
+        assetType,
+        useCarrot: false // TODO: Support CARROT staking when needed
+      }
+    );
+
+    // Validate
+    const validation = validateTransaction(tx);
+    if (!validation.valid) {
+      throw new Error(`Stake transaction validation failed: ${validation.errors.join(', ')}`);
+    }
+
+    // Add metadata for tracking
+    tx._meta = tx._meta || {};
+    tx._meta.txType = TX_TYPE.STAKE;
+    tx._meta.stakeAmount = stakeAmount.toString();
+    tx._meta.stakeLockPeriod = stakeLockPeriod;
+    tx._meta.unlockHeight = this._syncHeight + stakeLockPeriod;
+    tx._meta.assetType = assetType;
+
+    return tx;
   }
 
   /**

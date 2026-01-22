@@ -37,6 +37,7 @@ export * from './multisig.js';
 export * from './wallet-store.js';
 export * from './wallet-sync.js';
 export * from './persistent-wallet.js';
+export * from './consensus.js';
 
 // RandomX proof-of-work (WASM-JIT implementation)
 export * as randomx from './randomx/index.js';
@@ -570,6 +571,84 @@ import {
   restorePersistentWallet,
   openPersistentWallet
 } from './persistent-wallet.js';
+
+import {
+  // Constants
+  MONEY_SUPPLY,
+  EMISSION_SPEED_FACTOR_PER_MINUTE,
+  FINAL_SUBSIDY_PER_MINUTE,
+  COIN,
+  CRYPTONOTE_DISPLAY_DECIMAL_POINT,
+  PREMINE_AMOUNT,
+  PREMINE_AMOUNT_UPFRONT,
+  PREMINE_AMOUNT_MONTHLY,
+  TREASURY_SAL1_MINT_AMOUNT,
+  TREASURY_SAL1_MINT_COUNT,
+  DIFFICULTY_TARGET_V1,
+  DIFFICULTY_TARGET_V2 as CONSENSUS_DIFFICULTY_TARGET,
+  CRYPTONOTE_BLOCK_FUTURE_TIME_LIMIT,
+  BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW,
+  DIFFICULTY_WINDOW,
+  DIFFICULTY_WINDOW_V2,
+  DIFFICULTY_LAG,
+  DIFFICULTY_CUT,
+  DIFFICULTY_BLOCKS_COUNT,
+  DIFFICULTY_BLOCKS_COUNT_V2,
+  CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V1,
+  CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V2,
+  CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5,
+  CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE,
+  CRYPTONOTE_SHORT_TERM_BLOCK_WEIGHT_SURGE_FACTOR,
+  CRYPTONOTE_MAX_TX_SIZE,
+  CRYPTONOTE_MAX_TX_PER_BLOCK,
+  MAX_TX_EXTRA_SIZE,
+  BULLETPROOF_MAX_OUTPUTS,
+  BULLETPROOF_PLUS_MAX_OUTPUTS,
+  CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW,
+  CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS,
+  CURRENT_TRANSACTION_VERSION,
+  TRANSACTION_VERSION_2_OUTS,
+  TRANSACTION_VERSION_N_OUTS,
+  TRANSACTION_VERSION_CARROT,
+  DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT,
+  DEFAULT_DUST_THRESHOLD,
+  BASE_REWARD_CLAMP_THRESHOLD,
+  CRYPTONOTE_MEMPOOL_TX_LIVETIME,
+  CRYPTONOTE_MEMPOOL_TX_FROM_ALT_BLOCK_LIVETIME,
+  DEFAULT_TXPOOL_MAX_WEIGHT,
+  DEFAULT_RING_SIZE as CONSENSUS_DEFAULT_RING_SIZE,
+  PRICING_RECORD_VALID_BLOCKS,
+  PRICING_RECORD_VALID_TIME_DIFF_FROM_BLOCK,
+  BURN_LOCK_PERIOD,
+  CONVERT_LOCK_PERIOD,
+  HF_VERSION,
+  NETWORK_ID,
+  MAINNET_CONFIG,
+  TESTNET_CONFIG,
+  STAGENET_CONFIG,
+  // Functions
+  getNetworkConfig,
+  getMinBlockWeight,
+  getBlockReward,
+  getApproximateEmission,
+  nextDifficulty,
+  nextDifficultyV2,
+  checkHash as consensusCheckHash,
+  getMedianTimestamp,
+  validateBlockTimestamp,
+  isOutputUnlocked,
+  isCoinbaseMature,
+  meetsMinimumAge,
+  getMinimumFee,
+  getDynamicFee,
+  quantizeFee,
+  validateBlockLinkage,
+  validateBlockWeight,
+  validateTxSize,
+  validateTxExtraSize,
+  validateOutputCount,
+  validateRingSize
+} from './consensus.js';
 
 // Main API object
 const salvium = {

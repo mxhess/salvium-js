@@ -1,9 +1,11 @@
 /**
  * Ed25519 Elliptic Curve Operations
  *
- * Direct port from Salvium ref10 logic using BigInt for correctness.
- * Field elements are represented as BigInt in range [0, p) where p = 2^255 - 19
+ * Uses @noble/ed25519 for optimized scalar multiplication (hot path).
+ * Falls back to BigInt implementation for specialized operations.
  */
+
+import { Point as NoblePoint } from '@noble/ed25519';
 
 // Prime field: p = 2^255 - 19
 const P = (1n << 255n) - 19n;
@@ -316,28 +318,50 @@ export function scalarSub(r, a, b) {
 
 /**
  * Scalar multiplication with base point: s * G
+ * Uses @noble/ed25519 for optimized performance.
  * @param {Uint8Array} s - 32-byte scalar
  * @returns {Uint8Array} 32-byte compressed public key
  */
 export function scalarMultBase(s) {
-  const scalar = scalarFromBytes(s);
-  const G = pointFromXY(GX, GY);
-  const result = scalarMult(G, scalar);
-  return pointToBytes(result);
+  try {
+    // Convert scalar to BigInt (little-endian)
+    let scalar = 0n;
+    for (let i = 0; i < 32; i++) {
+      scalar |= BigInt(s[i]) << BigInt(i * 8);
+    }
+    // Use @noble for fast base point multiplication
+    const result = NoblePoint.BASE.multiply(scalar);
+    return result.toBytes();
+  } catch (e) {
+    // Fallback to original implementation
+    const scalarBig = scalarFromBytes(s);
+    const G = pointFromXY(GX, GY);
+    const result = scalarMult(G, scalarBig);
+    return pointToBytes(result);
+  }
 }
 
 /**
  * Scalar multiplication with arbitrary point: s * P
+ * Uses @noble/ed25519 for optimized performance.
  * @param {Uint8Array} s - 32-byte scalar
  * @param {Uint8Array} P - 32-byte compressed point
  * @returns {Uint8Array|null} 32-byte compressed result, or null if P is invalid
  */
 export function scalarMultPoint(s, P) {
-  const scalar = scalarFromBytes(s);
-  const point = pointFromBytes(P);
-  if (!point) return null;
-  const result = scalarMult(point, scalar);
-  return pointToBytes(result);
+  try {
+    // Convert scalar to BigInt (little-endian)
+    let scalar = 0n;
+    for (let i = 0; i < 32; i++) {
+      scalar |= BigInt(s[i]) << BigInt(i * 8);
+    }
+    // Use @noble for fast scalar multiplication
+    const point = NoblePoint.fromBytes(P);
+    const result = point.multiply(scalar);
+    return result.toBytes();
+  } catch (e) {
+    return null;
+  }
 }
 
 /**

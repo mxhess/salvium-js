@@ -16,6 +16,7 @@
 
 import { keccak256 } from './keccak.js';
 import { hexToBytes, bytesToHex } from './address.js';
+import { Point as NoblePoint } from '@noble/ed25519';
 import {
   scalarMultBase,
   scalarMultPoint,
@@ -128,23 +129,29 @@ export function generateKeyDerivation(txPubKey, viewSecretKey) {
     viewSecretKey = hexToBytes(viewSecretKey);
   }
 
-  // D = viewSecretKey * txPubKey (scalar mult)
-  const result = scalarMultPoint(viewSecretKey, txPubKey);
-  if (!result) return null;
+  try {
+    // Convert scalar to BigInt (little-endian)
+    let scalar = 0n;
+    for (let i = 0; i < 32; i++) {
+      scalar |= BigInt(viewSecretKey[i]) << BigInt(i * 8);
+    }
 
-  // Multiply by cofactor 8 to clear small subgroup components
-  // This is done by doubling 3 times (8 = 2^3)
-  let point = pointFromBytes(result);
-  if (!point) return null;
+    // D = viewSecretKey * txPubKey (scalar mult)
+    const point = NoblePoint.fromBytes(txPubKey);
+    const result = point.multiply(scalar);
 
-  // 8 * point via repeated doubling
-  // Since we're using extended coordinates, we do: result + result (3 times)
-  // Or equivalently, multiply scalar by 8
-  const eight = new Uint8Array(32);
-  eight[0] = 8;
-  const derivation = scalarMultPoint(eight, result);
+    // Multiply by cofactor 8 using fast doubling (8 = 2^3)
+    const derivation = result.double().double().double();
 
-  return derivation;
+    return derivation.toBytes();
+  } catch (e) {
+    // Fallback to original implementation
+    const result = scalarMultPoint(viewSecretKey, txPubKey);
+    if (!result) return null;
+    const eight = new Uint8Array(32);
+    eight[0] = 8;
+    return scalarMultPoint(eight, result);
+  }
 }
 
 /**
@@ -253,11 +260,25 @@ export function deriveSubaddressPublicKey(outputKey, derivation, outputIndex) {
     derivation = hexToBytes(derivation);
   }
 
+  // Validate inputs
+  if (!outputKey || !(outputKey instanceof Uint8Array) || outputKey.length !== 32) {
+    return null;
+  }
+  if (!derivation || !(derivation instanceof Uint8Array) || derivation.length !== 32) {
+    return null;
+  }
+
   // scalar = H_s(derivation || output_index)
   const scalar = derivationToScalar(derivation, outputIndex);
+  if (!scalar) {
+    return null;
+  }
 
   // scalar * G
   const scalarG = scalarMultBase(scalar);
+  if (!scalarG || scalarG.length !== 32) {
+    return null;
+  }
 
   // Negate the point (subtract instead of add)
   // In Ed25519, negating a point means negating the x-coordinate
@@ -276,10 +297,12 @@ export function deriveSubaddressPublicKey(outputKey, derivation, outputIndex) {
 
 /**
  * Derive view tag for fast output filtering
- * view_tag = first byte of H(derivation || varint(output_index))
+ * view_tag = first byte of H("view_tag" || derivation || varint(output_index))
  *
  * View tags allow wallets to quickly filter out non-owned outputs
  * without performing the full stealth address derivation.
+ *
+ * Matches Salvium C++ crypto_ops::derive_view_tag in crypto.cpp
  *
  * @param {Uint8Array|string} derivation - 32-byte key derivation
  * @param {number} outputIndex - Output index
@@ -290,11 +313,15 @@ export function deriveViewTag(derivation, outputIndex) {
     derivation = hexToBytes(derivation);
   }
 
-  // Same hash computation as derivationToScalar
+  // Salvium uses "view_tag" (8 bytes) as salt prefix
+  const salt = new TextEncoder().encode('view_tag'); // 8 bytes
   const indexBytes = encodeVarint(outputIndex);
-  const input = new Uint8Array(derivation.length + indexBytes.length);
-  input.set(derivation);
-  input.set(indexBytes, derivation.length);
+
+  // Build: salt || derivation || varint(output_index)
+  const input = new Uint8Array(salt.length + derivation.length + indexBytes.length);
+  input.set(salt);
+  input.set(derivation, salt.length);
+  input.set(indexBytes, salt.length + derivation.length);
 
   const hash = keccak256(input);
 
@@ -345,26 +372,21 @@ function genCommitmentMask(sharedSecret) {
 }
 
 /**
- * Compute shared secret for output
- * This is the key used for ecdhEncode/ecdhDecode
+ * Compute shared secret for output (used for ECDH amount encoding/decoding)
+ *
+ * This is equivalent to Salvium's derivation_to_scalar, which computes:
+ * hash_to_scalar(derivation || varint(output_index))
+ *
+ * Matches Salvium C++ crypto_ops::derivation_to_scalar in crypto.cpp
  *
  * @param {Uint8Array|string} derivation - 32-byte key derivation
  * @param {number} outputIndex - Output index
- * @returns {Uint8Array} 32-byte shared secret
+ * @returns {Uint8Array} 32-byte scalar (reduced mod L)
  */
 export function computeSharedSecret(derivation, outputIndex) {
-  // The shared secret is derived from derivation + output index
-  // It's essentially the same as derivationToScalar but used differently
-  if (typeof derivation === 'string') {
-    derivation = hexToBytes(derivation);
-  }
-
-  const indexBytes = encodeVarint(outputIndex);
-  const input = new Uint8Array(derivation.length + indexBytes.length);
-  input.set(derivation);
-  input.set(indexBytes, derivation.length);
-
-  return keccak256(input);
+  // Salvium uses derivation_to_scalar which calls hash_to_scalar
+  // This hashes and then reduces mod L (curve order)
+  return derivationToScalar(derivation, outputIndex);
 }
 
 /**
@@ -616,6 +638,9 @@ export function scanTransaction(tx, viewSecretKey, spendPubKey) {
 // Exports
 // ============================================================================
 
+// Named export for scalarAdd
+export { scalarAdd };
+
 export default {
   // Key derivation
   generateKeyDerivation,
@@ -640,5 +665,6 @@ export default {
   scanTransaction,
 
   // Utilities
-  encodeVarint: encodeVarint
+  encodeVarint: encodeVarint,
+  scalarAdd
 };

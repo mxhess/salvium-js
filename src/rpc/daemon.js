@@ -384,17 +384,36 @@ export class DaemonRPC extends RPCClient {
   // ============================================================
 
   /**
-   * Get outputs by index
+   * Get outputs by index (JSON format)
    * @param {Object[]} outputs - Array of {amount, index} objects
    * @param {Object} [options={}] - Options
    * @param {boolean} [options.get_txid=false] - Include transaction IDs
+   * @param {string} [options.asset_type='SAL'] - Asset type (Salvium-specific)
    * @returns {Promise<RPCResponse>} Output data
    */
   async getOuts(outputs, options = {}) {
     return this.post('/get_outs', {
       outputs,
-      get_txid: options.get_txid || false
+      get_txid: options.get_txid || false,
+      asset_type: options.asset_type || 'SAL'
     });
+  }
+
+  /**
+   * Get outputs by index (binary format - more efficient)
+   * Returns: key, mask, unlocked, height, txid, output_id for each output
+   * @param {Object[]} outputs - Array of {amount, index} objects
+   * @param {Object} [options={}] - Options
+   * @param {boolean} [options.get_txid=true] - Include transaction IDs
+   * @param {string} [options.asset_type='SAL'] - Asset type (Salvium-specific)
+   * @returns {Promise<RPCResponse>} Output data with outs[]
+   */
+  async getOutputs(outputs, options = {}) {
+    return this.post('/get_outs.bin', {
+      outputs,
+      get_txid: options.get_txid !== false,
+      asset_type: options.asset_type || 'SAL'
+    }, 'binary');
   }
 
   /**
@@ -423,6 +442,7 @@ export class DaemonRPC extends RPCClient {
    * @param {Object} [options={}] - Options
    * @param {number} [options.from_height=0] - Start height
    * @param {number} [options.to_height] - End height
+   * @param {string} [options.rct_asset_type='SAL'] - RCT asset type (Salvium-specific)
    * @param {boolean} [options.cumulative=false] - Return cumulative distribution
    * @param {boolean} [options.binary=true] - Use binary format
    * @param {boolean} [options.compress=false] - Compress response
@@ -433,6 +453,7 @@ export class DaemonRPC extends RPCClient {
       amounts,
       from_height: options.from_height || 0,
       to_height: options.to_height,
+      rct_asset_type: options.rct_asset_type || 'SAL',
       cumulative: options.cumulative || false,
       binary: options.binary !== false,
       compress: options.compress || false

@@ -11,10 +11,17 @@ Salvium™ and related names, logos, and branding are trademarks of the
 Salvium project and are not licensed under the Apache License.
 
 Third-Party Components:
-This project may include or depend on third-party software components,
-including but not limited to RandomX, which are licensed under their
-respective licenses. Such licenses are provided in the relevant source
-files or documentation.
+This project includes or depends on third-party software components:
+
+@noble/ed25519 - Optimized Ed25519 elliptic curve operations
+  Copyright (c) 2019 Paul Miller (https://paulmillr.com)
+  Licensed under the MIT License
+  https://github.com/paulmillr/noble-ed25519
+
+RandomX - Proof-of-work algorithm
+  Licensed under its respective license
+
+Such licenses are provided in the relevant source files or documentation.
 
 Disclaimer:
 This software is provided "AS IS", without warranty of any kind, express
