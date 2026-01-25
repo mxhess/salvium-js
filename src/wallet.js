@@ -25,6 +25,7 @@ import {
   buildTransaction,
   buildStakeTransaction,
   buildBurnTransaction,
+  buildConvertTransaction,
   signTransaction,
   prepareInputs,
   selectUTXOs,
@@ -1456,6 +1457,169 @@ export class Wallet {
     tx._meta.txType = TX_TYPE.BURN;
     tx._meta.burnAmount = burnAmount.toString();
     tx._meta.assetType = assetType;
+
+    return tx;
+  }
+
+  /**
+   * Create a CONVERT transaction (Salvium-specific)
+   *
+   * CONVERT transactions convert between asset types (SAL <-> VSD) using oracle pricing.
+   * The actual conversion happens at the protocol layer when the block is mined.
+   *
+   * NOTE: CONVERT transactions are currently gated behind hard fork version 255
+   * and are not yet enabled on mainnet. This function will build valid transactions
+   * but they will be rejected by nodes until the feature is activated.
+   *
+   * @param {bigint|number|string} amount - Amount to convert (in source asset atomic units)
+   * @param {Object} options - Options:
+   *   - sourceAsset: Asset to convert FROM ('SAL' or 'VSD'), default 'SAL'
+   *   - destAsset: Asset to convert TO ('VSD' or 'SAL'), default 'VSD'
+   *   - slippageLimit: Maximum acceptable slippage (default: 3.125% = amount/32)
+   *   - accountIndex: Source account index (default: 0)
+   *   - ringSize: Ring size for anonymity (default: 16)
+   *   - priority: Fee priority ('low'|'default'|'elevated'|'priority')
+   *   - rpcClient: RPC client for fetching ring members
+   * @returns {Promise<Object>} Convert transaction ready for broadcast
+   */
+  async createConvertTransaction(amount, options = {}) {
+    if (!this.canSign()) {
+      throw new Error('Full wallet required to create convert transactions');
+    }
+
+    const {
+      sourceAsset = 'SAL',
+      destAsset = 'VSD',
+      slippageLimit = null,  // null = use default (3.125%)
+      accountIndex = 0,
+      ringSize = 16,
+      priority = 'default',
+      rpcClient = null
+    } = options;
+
+    // Validate asset types
+    const validAssets = ['SAL', 'VSD'];
+    if (!validAssets.includes(sourceAsset)) {
+      throw new Error(`Invalid source asset: ${sourceAsset}. Must be SAL or VSD`);
+    }
+    if (!validAssets.includes(destAsset)) {
+      throw new Error(`Invalid destination asset: ${destAsset}. Must be SAL or VSD`);
+    }
+    if (sourceAsset === destAsset) {
+      throw new Error('Source and destination assets must be different for conversion');
+    }
+
+    // Convert amount to bigint
+    const convertAmount = typeof amount === 'bigint' ? amount :
+                          typeof amount === 'string' ? BigInt(amount) : BigInt(Math.floor(amount));
+
+    if (convertAmount <= 0n) {
+      throw new Error('Convert amount must be positive');
+    }
+
+    // Calculate slippage limit
+    const defaultSlippage = convertAmount >> 5n; // 1/32 = 3.125%
+    let slippageLimitBig;
+    if (slippageLimit !== null && slippageLimit !== undefined) {
+      slippageLimitBig = typeof slippageLimit === 'bigint' ? slippageLimit :
+                         typeof slippageLimit === 'string' ? BigInt(slippageLimit) :
+                         BigInt(Math.floor(slippageLimit));
+      if (slippageLimitBig < defaultSlippage) {
+        throw new Error(`Slippage limit ${slippageLimitBig} is below protocol minimum ${defaultSlippage} (3.125%)`);
+      }
+    } else {
+      slippageLimitBig = defaultSlippage;
+    }
+
+    // Estimate fee (CONVERT tx has 1 input minimum, 1 output - change only)
+    // The converted output is created by the protocol_tx at block time
+    const estimatedFee = estimateTransactionFee(
+      1, // inputs
+      1, // outputs (change only)
+      { priority, ringSize }
+    );
+
+    // Select UTXOs from specified account
+    const availableUTXOs = this.getUTXOs({
+      unlockedOnly: true,
+      accountIndex,
+      assetType: sourceAsset
+    });
+
+    if (availableUTXOs.length === 0) {
+      throw new Error(`No unlocked ${sourceAsset} outputs available for conversion`);
+    }
+
+    // Select UTXOs to cover convert amount + fee
+    const { selected, changeAmount } = selectUTXOs(
+      availableUTXOs,
+      convertAmount,
+      estimatedFee,
+      {
+        strategy: UTXO_STRATEGY.LARGEST_FIRST,
+        currentHeight: this._syncHeight,
+        dustThreshold: 1000000n
+      }
+    );
+
+    if (selected.length === 0) {
+      throw new Error(`Insufficient ${sourceAsset} balance for conversion of ${convertAmount} + fee ${estimatedFee}`);
+    }
+
+    // Prepare inputs with ring members (decoys)
+    const preparedInputs = await prepareInputs(selected, rpcClient, { ringSize });
+
+    // Recalculate fee with actual input count
+    const actualFee = estimateTransactionFee(
+      preparedInputs.length,
+      1, // Only change output (converted amount from protocol_tx)
+      { priority, ringSize }
+    );
+
+    // Change address is own address
+    const changeAddress = {
+      viewPublicKey: this._viewPublicKey,
+      spendPublicKey: this._spendPublicKey,
+      isSubaddress: false
+    };
+
+    // Return address for receiving converted amount (also own address)
+    // This is where the protocol_tx will send the converted output
+    const returnAddress = this._spendPublicKey;
+    const returnPubkey = this._viewPublicKey;
+
+    // Build the convert transaction
+    const tx = buildConvertTransaction(
+      {
+        inputs: preparedInputs,
+        convertAmount,
+        sourceAsset,
+        destAsset,
+        slippageLimit: slippageLimitBig,
+        changeAddress,
+        returnAddress,
+        returnPubkey,
+        fee: actualFee
+      },
+      {
+        useCarrot: false // TODO: Support CARROT conversion when needed
+      }
+    );
+
+    // Validate
+    const validation = validateTransaction(tx);
+    if (!validation.valid) {
+      throw new Error(`Convert transaction validation failed: ${validation.errors.join(', ')}`);
+    }
+
+    // Add metadata for tracking
+    tx._meta = tx._meta || {};
+    tx._meta.txType = 'CONVERT';
+    tx._meta.convertAmount = convertAmount.toString();
+    tx._meta.sourceAsset = sourceAsset;
+    tx._meta.destAsset = destAsset;
+    tx._meta.slippageLimit = slippageLimitBig.toString();
+    tx._meta.expectedSlippage = defaultSlippage.toString();
 
     return tx;
   }

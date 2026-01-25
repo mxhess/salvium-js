@@ -2962,10 +2962,11 @@ export function buildTransaction(params, options = {}) {
   if (!inputs || inputs.length === 0) {
     throw new Error('At least one input is required');
   }
-  // STAKE and BURN transactions can have no payment destinations (only change)
-  // The "burned" amount goes to amount_burnt field, not to outputs
+  // STAKE, BURN, and CONVERT transactions can have no payment destinations (only change)
+  // - STAKE/BURN: The "burned" amount goes to amount_burnt field, not to outputs
+  // - CONVERT: The converted output is created by the protocol_tx at block mining time
   if ((!destinations || destinations.length === 0) &&
-      txType !== TX_TYPE.STAKE && txType !== TX_TYPE.BURN) {
+      txType !== TX_TYPE.STAKE && txType !== TX_TYPE.BURN && txType !== TX_TYPE.CONVERT) {
     throw new Error('At least one destination is required');
   }
 
@@ -3373,6 +3374,146 @@ export function buildBurnTransaction(params, options = {}) {
       returnPubkey: null,
       protocolTxData: null,
       amountSlippageLimit: 0n
+    }
+  );
+}
+
+/**
+ * Build a CONVERT transaction
+ *
+ * CONVERT transactions convert between asset types (SAL <-> VSD) using oracle pricing.
+ * The actual conversion happens at the protocol layer when the block is mined.
+ *
+ * NOTE: CONVERT transactions are currently gated behind hard fork version 255
+ * and are not yet enabled on mainnet.
+ *
+ * @param {Object} params - Transaction parameters:
+ *   - inputs: Array of inputs to spend
+ *   - convertAmount: Amount to convert (in source asset)
+ *   - sourceAsset: Asset type to convert FROM ('SAL' or 'VSD')
+ *   - destAsset: Asset type to convert TO ('VSD' or 'SAL')
+ *   - slippageLimit: Maximum acceptable slippage (default: 3.125% = amount/32)
+ *   - changeAddress: Address object for change output
+ *   - returnAddress: Public key for receiving converted amount (derived from wallet keys)
+ *   - returnPubkey: TX public key for ECDH (derived from wallet keys)
+ *   - fee: Transaction fee
+ * @param {Object} options - Optional settings:
+ *   - txSecretKey: Pre-set transaction secret key
+ *   - useCarrot: Use CARROT output format
+ * @returns {Object} Built transaction ready for broadcast
+ */
+export function buildConvertTransaction(params, options = {}) {
+  const {
+    inputs,
+    convertAmount,
+    sourceAsset,
+    destAsset,
+    slippageLimit,
+    changeAddress,
+    returnAddress,
+    returnPubkey,
+    fee
+  } = params;
+
+  const {
+    txSecretKey,
+    useCarrot = false
+  } = options;
+
+  // Validate inputs
+  if (!inputs || inputs.length === 0) {
+    throw new Error('At least one input is required');
+  }
+  if (!convertAmount || convertAmount <= 0n) {
+    throw new Error('Convert amount must be positive');
+  }
+  if (!sourceAsset) {
+    throw new Error('Source asset type is required');
+  }
+  if (!destAsset) {
+    throw new Error('Destination asset type is required');
+  }
+  if (sourceAsset === destAsset) {
+    throw new Error('Source and destination asset types must be different');
+  }
+
+  // Only SAL <-> VSD conversions are valid
+  const validPairs = [
+    ['SAL', 'VSD'],
+    ['VSD', 'SAL']
+  ];
+  const isValidPair = validPairs.some(
+    ([from, to]) => from === sourceAsset && to === destAsset
+  );
+  if (!isValidPair) {
+    throw new Error(`Invalid conversion pair: ${sourceAsset} -> ${destAsset}. Only SAL <-> VSD conversions are allowed`);
+  }
+
+  if (!changeAddress) {
+    throw new Error('Change address is required for convert transaction');
+  }
+  if (!returnAddress) {
+    throw new Error('Return address is required for convert transaction');
+  }
+  if (!returnPubkey) {
+    throw new Error('Return pubkey is required for convert transaction');
+  }
+
+  const convertAmountBig = typeof convertAmount === 'bigint' ? convertAmount : BigInt(convertAmount);
+  const feeBig = typeof fee === 'bigint' ? fee : BigInt(fee);
+
+  // Calculate slippage limit - default is 1/32 (3.125%) of convert amount
+  // User can specify lower but not lower than protocol minimum
+  const defaultSlippage = convertAmountBig >> 5n; // amount / 32
+  let slippageLimitBig;
+  if (slippageLimit !== undefined && slippageLimit !== null) {
+    slippageLimitBig = typeof slippageLimit === 'bigint' ? slippageLimit : BigInt(slippageLimit);
+    // Slippage limit must be >= protocol slippage (1/32) for conversion to succeed
+    if (slippageLimitBig < defaultSlippage) {
+      throw new Error(`Slippage limit ${slippageLimitBig} is below protocol minimum ${defaultSlippage} (3.125%)`);
+    }
+  } else {
+    slippageLimitBig = defaultSlippage;
+  }
+
+  // Calculate total input amount
+  let totalInputAmount = 0n;
+  for (const input of inputs) {
+    const amount = typeof input.amount === 'bigint' ? input.amount : BigInt(input.amount);
+    totalInputAmount += amount;
+  }
+
+  // For CONVERT: converted amount goes in amount_burnt, only change output in this tx
+  // The converted output is created by the protocol_tx at block mining time
+  const changeAmount = totalInputAmount - convertAmountBig - feeBig;
+  if (changeAmount < 0n) {
+    throw new Error(`Insufficient funds: inputs=${totalInputAmount}, convert=${convertAmountBig}, fee=${feeBig}`);
+  }
+
+  // CONVERT has no direct destinations - converted output comes from protocol_tx
+  // Only change output is included in this transaction
+  const destinations = [];
+
+  // Build using base buildTransaction with CONVERT options
+  return buildTransaction(
+    {
+      inputs,
+      destinations,  // Empty - converted output created by protocol_tx
+      changeAddress,
+      fee
+    },
+    {
+      unlockTime: 0,  // CONVERT has no lock period
+      txSecretKey,
+      useCarrot,
+      txType: TX_TYPE.CONVERT,
+      amountBurnt: convertAmountBig,  // Amount being converted
+      sourceAssetType: sourceAsset,
+      destinationAssetType: destAsset,
+      returnAddress,
+      returnPubkey,
+      protocolTxData: null,
+      amountSlippageLimit: slippageLimitBig
     }
   );
 }
