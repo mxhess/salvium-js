@@ -2962,11 +2962,12 @@ export function buildTransaction(params, options = {}) {
   if (!inputs || inputs.length === 0) {
     throw new Error('At least one input is required');
   }
-  // STAKE, BURN, and CONVERT transactions can have no payment destinations (only change)
+  // STAKE, BURN, CONVERT, and AUDIT transactions can have no payment destinations
   // - STAKE/BURN: The "burned" amount goes to amount_burnt field, not to outputs
   // - CONVERT: The converted output is created by the protocol_tx at block mining time
+  // - AUDIT: All coins locked (change-is-zero), returned via protocol_tx after maturity
   if ((!destinations || destinations.length === 0) &&
-      txType !== TX_TYPE.STAKE && txType !== TX_TYPE.BURN && txType !== TX_TYPE.CONVERT) {
+      txType !== TX_TYPE.STAKE && txType !== TX_TYPE.BURN && txType !== TX_TYPE.CONVERT && txType !== TX_TYPE.AUDIT) {
     throw new Error('At least one destination is required');
   }
 
@@ -3514,6 +3515,140 @@ export function buildConvertTransaction(params, options = {}) {
       returnPubkey,
       protocolTxData: null,
       amountSlippageLimit: slippageLimitBig
+    }
+  );
+}
+
+/**
+ * Build an AUDIT transaction
+ *
+ * AUDIT transactions enable users to participate in periodic compliance/transparency
+ * audits during designated AUDIT hard fork periods. Users voluntarily lock their
+ * holdings for a defined period, providing cryptographic proofs of ownership.
+ *
+ * NOTE: AUDIT transactions are only valid during specific AUDIT hard fork periods
+ * (HF v6, v8). Transactions submitted outside these windows will be rejected.
+ *
+ * @param {Object} params - Transaction parameters:
+ *   - inputs: Array of inputs to spend (all coins from the wallet/subaddress)
+ *   - auditAmount: Total amount being audited (locked)
+ *   - sourceAsset: Asset type being audited ('SAL' or 'SAL1' depending on HF)
+ *   - destAsset: Asset type received after maturity ('SAL1')
+ *   - unlockHeight: Block height when coins unlock (current_height + lock_period)
+ *   - returnAddress: Public key for receiving coins after maturity
+ *   - returnPubkey: TX public key for ECDH
+ *   - fee: Transaction fee
+ * @param {Object} options - Optional settings:
+ *   - txSecretKey: Pre-set transaction secret key
+ *   - useCarrot: Use CARROT output format
+ *   - viewSecretKey: View secret key for audit disclosure (encrypted in tx)
+ *   - spendPublicKey: Spend public key for audit verification
+ * @returns {Object} Built transaction ready for broadcast
+ */
+export function buildAuditTransaction(params, options = {}) {
+  const {
+    inputs,
+    auditAmount,
+    sourceAsset,
+    destAsset,
+    unlockHeight,
+    returnAddress,
+    returnPubkey,
+    fee
+  } = params;
+
+  const {
+    txSecretKey,
+    useCarrot = false,
+    viewSecretKey = null,
+    spendPublicKey = null
+  } = options;
+
+  // Validate inputs
+  if (!inputs || inputs.length === 0) {
+    throw new Error('At least one input is required');
+  }
+  if (!auditAmount || auditAmount <= 0n) {
+    throw new Error('Audit amount must be positive');
+  }
+  if (!sourceAsset) {
+    throw new Error('Source asset type is required');
+  }
+  if (!destAsset) {
+    throw new Error('Destination asset type is required');
+  }
+
+  // AUDIT transactions convert SAL -> SAL1 or audit SAL1 -> SAL1
+  const validPairs = [
+    ['SAL', 'SAL1'],
+    ['SAL1', 'SAL1']
+  ];
+  const isValidPair = validPairs.some(
+    ([from, to]) => from === sourceAsset && to === destAsset
+  );
+  if (!isValidPair) {
+    throw new Error(`Invalid audit asset pair: ${sourceAsset} -> ${destAsset}. AUDIT uses SAL->SAL1 or SAL1->SAL1`);
+  }
+
+  if (!returnAddress) {
+    throw new Error('Return address is required for audit transaction');
+  }
+  if (!returnPubkey) {
+    throw new Error('Return pubkey is required for audit transaction');
+  }
+  if (!unlockHeight || unlockHeight <= 0) {
+    throw new Error('Unlock height must be positive');
+  }
+
+  const auditAmountBig = typeof auditAmount === 'bigint' ? auditAmount : BigInt(auditAmount);
+  const feeBig = typeof fee === 'bigint' ? fee : BigInt(fee);
+
+  // Calculate total input amount
+  let totalInputAmount = 0n;
+  for (const input of inputs) {
+    const amount = typeof input.amount === 'bigint' ? input.amount : BigInt(input.amount);
+    totalInputAmount += amount;
+  }
+
+  // For AUDIT: all coins are locked (minus fee), no change output
+  // The change-is-zero proof requires that change = 0
+  const expectedAudit = totalInputAmount - feeBig;
+  if (auditAmountBig !== expectedAudit) {
+    throw new Error(
+      `AUDIT requires all inputs minus fee. Expected audit amount: ${expectedAudit}, got: ${auditAmountBig}. ` +
+      `AUDIT transactions must lock all coins (no change allowed).`
+    );
+  }
+
+  // AUDIT has no change output - change-is-zero is a requirement
+  // The locked coins return via protocol_tx after maturity
+  const destinations = [];
+
+  // Build using base buildTransaction with AUDIT options
+  return buildTransaction(
+    {
+      inputs,
+      destinations,  // Empty - AUDIT has no payment destinations, no change
+      changeAddress: null,  // No change for AUDIT
+      fee
+    },
+    {
+      unlockTime: unlockHeight,  // Unlock after the audit period
+      txSecretKey,
+      useCarrot,
+      txType: TX_TYPE.AUDIT,
+      amountBurnt: auditAmountBig,  // Amount being locked for audit
+      sourceAssetType: sourceAsset,
+      destinationAssetType: destAsset,
+      returnAddress,
+      returnPubkey,
+      protocolTxData: null,
+      amountSlippageLimit: 0n,  // Not used for AUDIT
+      // AUDIT-specific options for the special proofs
+      auditData: {
+        viewSecretKey,  // For encrypted view key disclosure
+        spendPublicKey  // For spend authority verification
+      }
     }
   );
 }

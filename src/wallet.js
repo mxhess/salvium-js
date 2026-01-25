@@ -26,6 +26,7 @@ import {
   buildStakeTransaction,
   buildBurnTransaction,
   buildConvertTransaction,
+  buildAuditTransaction,
   signTransaction,
   prepareInputs,
   selectUTXOs,
@@ -1625,14 +1626,150 @@ export class Wallet {
   }
 
   /**
-   * Create an audit transaction (Salvium-specific)
-   * @param {Object} options - Options
-   * @returns {Promise<Object>} Audit transaction
+   * Create an AUDIT transaction (Salvium-specific)
+   *
+   * AUDIT transactions enable users to participate in periodic compliance/transparency
+   * audits during designated AUDIT hard fork periods. Users voluntarily lock ALL their
+   * holdings (or from a specific account/subaddress) for a defined period.
+   *
+   * NOTE: AUDIT transactions are only valid during specific AUDIT hard fork periods
+   * (HF v6, v8). Transactions submitted outside these windows will be rejected.
+   *
+   * The change-is-zero requirement means ALL coins must be locked - no partial audits.
+   * Coins are returned via protocol_tx after the lock period expires.
+   *
+   * @param {Object} options - Options:
+   *   - sourceAsset: Asset to audit ('SAL' or 'SAL1' depending on HF), default 'SAL'
+   *   - destAsset: Asset received after maturity ('SAL1'), default 'SAL1'
+   *   - accountIndex: Source account index (default: 0)
+   *   - subaddressIndices: Specific subaddresses to audit (default: all)
+   *   - lockPeriod: Lock period in blocks (default: network-specific from AUDIT_HARD_FORKS)
+   *   - ringSize: Ring size for anonymity (default: 16)
+   *   - priority: Fee priority ('low'|'default'|'elevated'|'priority')
+   *   - rpcClient: RPC client for fetching ring members
+   * @returns {Promise<Object>} Audit transaction ready for broadcast
    */
   async createAuditTransaction(options = {}) {
-    // TODO: Implement audit transaction following Salvium spec
-    // This creates a TX_TYPE.AUDIT transaction
-    throw new Error('Audit transactions not yet implemented');
+    if (!this.canSign()) {
+      throw new Error('Full wallet required to create audit transactions');
+    }
+
+    const {
+      sourceAsset = 'SAL',
+      destAsset = 'SAL1',
+      accountIndex = 0,
+      subaddressIndices = null,  // null = all subaddresses in account
+      lockPeriod = null,  // null = use network default from AUDIT_HARD_FORKS
+      ringSize = 16,
+      priority = 'default',
+      rpcClient = null
+    } = options;
+
+    // Validate asset types
+    const validSourceAssets = ['SAL', 'SAL1'];
+    if (!validSourceAssets.includes(sourceAsset)) {
+      throw new Error(`Invalid source asset: ${sourceAsset}. Must be SAL or SAL1`);
+    }
+    if (destAsset !== 'SAL1') {
+      throw new Error(`Invalid destination asset: ${destAsset}. AUDIT destination must be SAL1`);
+    }
+
+    // Get all UTXOs from the specified account/subaddresses
+    const utxoOptions = {
+      unlockedOnly: true,
+      accountIndex,
+      assetType: sourceAsset
+    };
+    if (subaddressIndices) {
+      utxoOptions.subaddressIndices = subaddressIndices;
+    }
+
+    const availableUTXOs = this.getUTXOs(utxoOptions);
+
+    if (availableUTXOs.length === 0) {
+      throw new Error(`No unlocked ${sourceAsset} outputs available for audit`);
+    }
+
+    // Calculate total amount to audit (ALL coins - change-is-zero requirement)
+    let totalAmount = 0n;
+    for (const utxo of availableUTXOs) {
+      totalAmount += typeof utxo.amount === 'bigint' ? utxo.amount : BigInt(utxo.amount);
+    }
+
+    // Estimate fee for all inputs, 0 outputs (AUDIT has no outputs)
+    const estimatedFee = estimateTransactionFee(
+      availableUTXOs.length,
+      0,  // AUDIT has 0 outputs (change-is-zero)
+      { priority, ringSize }
+    );
+
+    // Audit amount is total minus fee
+    const auditAmount = totalAmount - estimatedFee;
+    if (auditAmount <= 0n) {
+      throw new Error(`Insufficient funds: total ${totalAmount} minus fee ${estimatedFee} <= 0`);
+    }
+
+    // Prepare inputs with ring members (decoys)
+    const preparedInputs = await prepareInputs(availableUTXOs, rpcClient, { ringSize });
+
+    // Recalculate fee with actual input count
+    const actualFee = estimateTransactionFee(
+      preparedInputs.length,
+      0,  // AUDIT has 0 outputs
+      { priority, ringSize }
+    );
+
+    // Recalculate audit amount with actual fee
+    const actualAuditAmount = totalAmount - actualFee;
+    if (actualAuditAmount <= 0n) {
+      throw new Error(`Insufficient funds after fee calculation`);
+    }
+
+    // Calculate unlock height
+    // Default lock periods from C++: mainnet 30*24*10 or 30*24*14, testnet 30 or 40
+    const defaultLockPeriod = 30 * 24 * 10;  // ~10 days on mainnet (1 block/min)
+    const lockBlocks = lockPeriod || defaultLockPeriod;
+    const unlockHeight = this._syncHeight + lockBlocks;
+
+    // Return address and pubkey for receiving coins after maturity
+    const returnAddress = this._spendPublicKey;
+    const returnPubkey = this._viewPublicKey;
+
+    // Build the audit transaction
+    const tx = buildAuditTransaction(
+      {
+        inputs: preparedInputs,
+        auditAmount: actualAuditAmount,
+        sourceAsset,
+        destAsset,
+        unlockHeight,
+        returnAddress,
+        returnPubkey,
+        fee: actualFee
+      },
+      {
+        useCarrot: false,
+        viewSecretKey: this._viewSecretKey,  // For audit disclosure
+        spendPublicKey: this._spendPublicKey  // For spend authority verification
+      }
+    );
+
+    // Validate
+    const validation = validateTransaction(tx);
+    if (!validation.valid) {
+      throw new Error(`Audit transaction validation failed: ${validation.errors.join(', ')}`);
+    }
+
+    // Add metadata for tracking
+    tx._meta = tx._meta || {};
+    tx._meta.txType = 'AUDIT';
+    tx._meta.auditAmount = actualAuditAmount.toString();
+    tx._meta.sourceAsset = sourceAsset;
+    tx._meta.destAsset = destAsset;
+    tx._meta.unlockHeight = unlockHeight;
+    tx._meta.lockPeriod = lockBlocks;
+
+    return tx;
   }
 
   /**
