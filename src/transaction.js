@@ -11,7 +11,7 @@
  */
 
 import { keccak256, keccak256Hex } from './keccak.js';
-import { scalarMultBase, scalarMultPoint, pointAddCompressed, getGeneratorG } from './ed25519.js';
+import { scalarMultBase, scalarMultPoint, pointAddCompressed, getGeneratorG, getGeneratorT } from './ed25519.js';
 import { generateKeyDerivation, derivationToScalar, derivePublicKey, deriveSecretKey } from './scanning.js';
 import { hashToPoint, generateKeyImage } from './keyimage.js';
 import { bytesToHex, hexToBytes } from './address.js';
@@ -469,6 +469,193 @@ export function clsagSign(message, ring, secretKey, commitments, commitmentMask,
 }
 
 /**
+ * Generate a TCLSAG (Twin CLSAG) signature
+ *
+ * TCLSAG uses dual secret keys (x, y) and two generators (G, T) for enhanced
+ * security. Used in RCTTypeSalviumOne transactions.
+ *
+ * Key differences from CLSAG:
+ * - Two secret keys: x (spend component) and y (auxiliary component)
+ * - Two random scalars: a and b
+ * - Initial L = a*G + b*T, R = a*H(P)
+ * - Two response arrays: sx[] and sy[]
+ * - Final: sx[l] = a - c*(mu_P*x + mu_C*z), sy[l] = b - c*mu_P*y
+ *
+ * Reference: Salvium rctSigs.cpp TCLSAG_Gen (lines 375-520)
+ *
+ * @param {Uint8Array|string} message - Message to sign (usually pre-MLSAG hash)
+ * @param {Array<Uint8Array>} ring - Array of public keys in the ring
+ * @param {Uint8Array|string} secretKeyX - X component of secret key (spend key)
+ * @param {Uint8Array|string} secretKeyY - Y component of secret key (auxiliary)
+ * @param {Array<Uint8Array>} commitments - Array of non-zero commitments for each ring member
+ * @param {Uint8Array|string} commitmentMask - Mask for our commitment (z)
+ * @param {Uint8Array|string} pseudoOutputCommitment - Pseudo output commitment C'
+ * @param {number} secretIndex - Index of our key in the ring
+ * @returns {Object} TCLSAG signature { sx: Array, sy: Array, c1, I (key image), D (commitment key image) }
+ */
+export function tclsagSign(message, ring, secretKeyX, secretKeyY, commitments, commitmentMask, pseudoOutputCommitment, secretIndex) {
+  if (typeof message === 'string') message = hexToBytes(message);
+  if (typeof secretKeyX === 'string') secretKeyX = hexToBytes(secretKeyX);
+  if (typeof secretKeyY === 'string') secretKeyY = hexToBytes(secretKeyY);
+  if (typeof commitmentMask === 'string') commitmentMask = hexToBytes(commitmentMask);
+  if (typeof pseudoOutputCommitment === 'string') pseudoOutputCommitment = hexToBytes(pseudoOutputCommitment);
+
+  const n = ring.length; // Ring size
+
+  // Normalize inputs
+  ring = ring.map(k => typeof k === 'string' ? hexToBytes(k) : k);
+  commitments = commitments.map(c => typeof c === 'string' ? hexToBytes(c) : c);
+
+  // Get generator T (second basis point)
+  const T = getGeneratorT();
+
+  // Compute commitment differences: C[i] = commitment[i] - pseudoOutputCommitment
+  const C = commitments.map(c => pointSub(c, pseudoOutputCommitment));
+
+  // Compute key image: I = x * H_p(P)
+  const P_l = ring[secretIndex];
+  const I = generateKeyImage(P_l, secretKeyX);
+
+  // Compute commitment key image: D = z * H_p(P)
+  const H_P = hashToPoint(P_l);
+  const D = scalarMultPoint(commitmentMask, H_P);
+
+  // Note: For TCLSAG, we use D directly (not D_8) to maintain symmetry
+  // between the L equation (uses C = z*G) and R equation (uses D = z*Hp)
+  // This matches CLSAG behavior and ensures the signing equations are consistent
+
+  // Compute aggregate coefficients mu_P and mu_C
+  // For TCLSAG, aggregation uses C_nonzero (not C differences) plus I, D, C_offset
+  const aggData = [...ring, ...commitments, I, D, pseudoOutputCommitment];
+  const mu_P = hashToScalar(CLSAG_AGG_0, ...aggData);
+  const mu_C = hashToScalar(CLSAG_AGG_1, ...aggData);
+
+  // Initialize signature arrays
+  const sx = new Array(n);
+  const sy = new Array(n);
+
+  // Generate random scalars for the real input
+  const a = scRandom(); // For x component
+  const b = scRandom(); // For y component
+
+  // Compute initial values:
+  // L = a*G + b*T
+  // R = a*H_p(P_l)
+  const aG = scalarMultBase(a);
+  const bT = scalarMultPoint(b, T);
+  const L_init = pointAddCompressed(aG, bT);
+  const aH = scalarMultPoint(a, H_P);
+
+  // Build challenge hash (matches Salvium C++ - uses C_nonzero, not C differences)
+  const buildChallengeHash = (L, R) => {
+    return hashToScalar(CLSAG_ROUND, ...ring, ...commitments, pseudoOutputCommitment, message, L, R);
+  };
+
+  // Start the ring: first challenge from (a,b) commitments
+  let c = buildChallengeHash(L_init, aH);
+
+  // c1 will be captured when loop index becomes 0
+  let c1 = null;
+
+  // Start at position after secret index
+  let i = (secretIndex + 1) % n;
+
+  // If we start at index 0, capture c1 immediately
+  if (i === 0) {
+    c1 = new Uint8Array(c);
+  }
+
+  // Go around the ring until we reach the secret index
+  while (i !== secretIndex) {
+    // Generate random sx[i] and sy[i] for this decoy position
+    sx[i] = scRandom();
+    sy[i] = scRandom();
+
+    // Compute H_p(P_i)
+    const H_P_i = hashToPoint(ring[i]);
+
+    // Weighted challenges
+    const c_mu_P = scMul(c, mu_P);
+    const c_mu_C = scMul(c, mu_C);
+
+    // L = sx[i]*G + sy[i]*T + c*mu_P*P[i] + c*mu_C*C[i]
+    const sxG = scalarMultBase(sx[i]);
+    const syT = scalarMultPoint(sy[i], T);
+    const c_mu_P_Pi = scalarMultPoint(c_mu_P, ring[i]);
+    const c_mu_C_Ci = scalarMultPoint(c_mu_C, C[i]);
+
+    let L = pointAddCompressed(sxG, syT);
+    L = pointAddCompressed(L, c_mu_P_Pi);
+    L = pointAddCompressed(L, c_mu_C_Ci);
+
+    // R = sx[i]*H_p(P[i]) + c*mu_P*I + c*mu_C*D
+    const sxH = scalarMultPoint(sx[i], H_P_i);
+    const c_mu_P_I = scalarMultPoint(c_mu_P, I);
+    const c_mu_C_D = scalarMultPoint(c_mu_C, D);
+
+    let R = pointAddCompressed(sxH, c_mu_P_I);
+    R = pointAddCompressed(R, c_mu_C_D);
+
+    // Next challenge
+    c = buildChallengeHash(L, R);
+
+    // Advance to next ring member
+    i = (i + 1) % n;
+
+    // Capture c1 when we wrap to index 0
+    if (i === 0) {
+      c1 = new Uint8Array(c);
+    }
+  }
+
+  // Now c is the challenge at the secret position (c_l)
+  // Compute sx[l] and sy[l] to close the ring:
+  // sx[l] = a - c * (mu_P * x + mu_C * z)
+  // sy[l] = b (T component closes without secret key contribution when P = x*G)
+  const mu_P_x = scMul(mu_P, secretKeyX);
+  const mu_C_z = scMul(mu_C, commitmentMask);
+  const sum_x = scAdd(mu_P_x, mu_C_z);
+  const c_sum_x = scMul(c, sum_x);
+  sx[secretIndex] = scSub(a, c_sum_x);
+
+  // sy[l] = b (no secret key component for T generator)
+  sy[secretIndex] = b;
+
+  // If c1 wasn't captured, compute it now
+  if (c1 === null) {
+    const H_P_l = hashToPoint(ring[secretIndex]);
+    const c_mu_P = scMul(c, mu_P);
+    const c_mu_C = scMul(c, mu_C);
+
+    const sxG = scalarMultBase(sx[secretIndex]);
+    const syT = scalarMultPoint(sy[secretIndex], T);
+    const c_mu_P_Pl = scalarMultPoint(c_mu_P, ring[secretIndex]);
+    const c_mu_C_Cl = scalarMultPoint(c_mu_C, C[secretIndex]);
+
+    let L = pointAddCompressed(sxG, syT);
+    L = pointAddCompressed(L, c_mu_P_Pl);
+    L = pointAddCompressed(L, c_mu_C_Cl);
+
+    const sxH = scalarMultPoint(sx[secretIndex], H_P_l);
+    const c_mu_P_I = scalarMultPoint(c_mu_P, I);
+    const c_mu_C_D_c1 = scalarMultPoint(c_mu_C, D);
+
+    let R = pointAddCompressed(sxH, c_mu_P_I);
+    R = pointAddCompressed(R, c_mu_C_D_c1);
+
+    c1 = buildChallengeHash(L, R);
+  }
+
+  return {
+    sx: sx.map(si => bytesToHex(si)),
+    sy: sy.map(si => bytesToHex(si)),
+    c1: bytesToHex(c1),
+    I: bytesToHex(I),
+    D: bytesToHex(D)
+  };
+}
+
+/**
  * Point subtraction: A - B
  * @param {Uint8Array} a - First point
  * @param {Uint8Array} b - Second point
@@ -556,6 +743,98 @@ export function clsagVerify(message, sig, ring, commitments, pseudoOutputCommitm
     const R = pointAddCompressed(pointAddCompressed(sH, c_mu_P_I), c_mu_C_D);
 
     // c = H_n(domain, P[0..n-1], C[0..n-1], C_offset, message, L, R)
+    c = buildChallengeHash(L, R);
+  }
+
+  // After going around the ring, c should equal c1
+  return bytesToHex(c) === bytesToHex(c1);
+}
+
+/**
+ * Verify a TCLSAG (Twin CLSAG) signature
+ *
+ * TCLSAG uses two scalar arrays (sx, sy) for dual-component signing with generators G and T.
+ * This is used in RCTTypeSalviumOne transactions.
+ *
+ * Verification equation for each ring member i:
+ *   L = sx[i]*G + sy[i]*T + c*mu_P*P[i] + c*mu_C*(C[i] - C_offset)
+ *   R = sx[i]*H(P[i]) + c*mu_P*I + c*mu_C*D
+ *
+ * Reference: Salvium rctSigs.cpp lines 1207-1326
+ *
+ * @param {Uint8Array|string} message - Message that was signed
+ * @param {Object} sig - TCLSAG signature { sx, sy, c1, I, D }
+ * @param {Array<Uint8Array>} ring - Array of public keys
+ * @param {Array<Uint8Array>} commitments - Array of non-zero commitments (C_nonzero)
+ * @param {Uint8Array|string} pseudoOutputCommitment - Pseudo output commitment (C_offset)
+ * @returns {boolean} True if signature is valid
+ */
+export function tclsagVerify(message, sig, ring, commitments, pseudoOutputCommitment) {
+  if (typeof message === 'string') message = hexToBytes(message);
+  if (typeof pseudoOutputCommitment === 'string') pseudoOutputCommitment = hexToBytes(pseudoOutputCommitment);
+
+  const n = ring.length;
+
+  // Normalize inputs
+  ring = ring.map(k => typeof k === 'string' ? hexToBytes(k) : k);
+  commitments = commitments.map(c => typeof c === 'string' ? hexToBytes(c) : c);
+  const sx = sig.sx.map(si => typeof si === 'string' ? hexToBytes(si) : si);
+  const sy = sig.sy.map(si => typeof si === 'string' ? hexToBytes(si) : si);
+  const c1 = typeof sig.c1 === 'string' ? hexToBytes(sig.c1) : sig.c1;
+  const I = typeof sig.I === 'string' ? hexToBytes(sig.I) : sig.I;
+  const D = typeof sig.D === 'string' ? hexToBytes(sig.D) : sig.D;
+
+  // Get generator T (second basis point for twin commitments)
+  const T = getGeneratorT();
+
+  // Compute commitment differences: C[i] = C_nonzero[i] - C_offset
+  const C = commitments.map(c => pointSub(c, pseudoOutputCommitment));
+
+  // Note: We use D directly (not D_8) to maintain symmetry with the L equation
+  // which uses C = z*G. This ensures signing equations are consistent.
+
+  // Compute aggregate coefficients mu_P and mu_C
+  // mu_P = H_n("CLSAG_agg_0", P[0..n-1], C_nonzero[0..n-1], I, D, C_offset)
+  // mu_C = H_n("CLSAG_agg_1", P[0..n-1], C_nonzero[0..n-1], I, D, C_offset)
+  const aggData = [...ring, ...commitments, I, D, pseudoOutputCommitment];
+  const mu_P = hashToScalar(CLSAG_AGG_0, ...aggData);
+  const mu_C = hashToScalar(CLSAG_AGG_1, ...aggData);
+
+  // Build challenge hash
+  // c = H_n("CLSAG_round", P[0..n-1], C_nonzero[0..n-1], C_offset, message, L, R)
+  const buildChallengeHash = (L, R) => {
+    return hashToScalar(CLSAG_ROUND, ...ring, ...commitments, pseudoOutputCommitment, message, L, R);
+  };
+
+  // Verify the ring
+  let c = c1;
+  for (let i = 0; i < n; i++) {
+    const H_P_i = hashToPoint(ring[i]);
+
+    // Compute scaled challenges
+    const c_mu_P = scMul(c, mu_P);
+    const c_mu_C = scMul(c, mu_C);
+
+    // L = sx[i]*G + sy[i]*T + c*mu_P*P[i] + c*mu_C*C[i]
+    // Where C[i] = C_nonzero[i] - C_offset (already computed above)
+    const sxG = scalarMultBase(sx[i]);
+    const syT = scalarMultPoint(sy[i], T);
+    const c_mu_P_Pi = scalarMultPoint(c_mu_P, ring[i]);
+    const c_mu_C_Ci = scalarMultPoint(c_mu_C, C[i]);
+
+    let L = pointAddCompressed(sxG, syT);
+    L = pointAddCompressed(L, c_mu_P_Pi);
+    L = pointAddCompressed(L, c_mu_C_Ci);
+
+    // R = sx[i]*H(P[i]) + c*mu_P*I + c*mu_C*D
+    const sxH = scalarMultPoint(sx[i], H_P_i);
+    const c_mu_P_I = scalarMultPoint(c_mu_P, I);
+    const c_mu_C_D = scalarMultPoint(c_mu_C, D);
+
+    let R = pointAddCompressed(sxH, c_mu_P_I);
+    R = pointAddCompressed(R, c_mu_C_D);
+
+    // Next challenge
     c = buildChallengeHash(L, R);
   }
 
