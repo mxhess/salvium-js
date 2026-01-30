@@ -186,6 +186,9 @@ export class WalletSync {
       }
       this.targetHeight = infoResponse.result.height;
 
+      // Detect chain reorganization before syncing
+      await this._detectReorg();
+
       this._emit('syncStart', {
         startHeight: this.startHeight,
         targetHeight: this.targetHeight
@@ -247,6 +250,93 @@ export class WalletSync {
   }
 
   // ===========================================================================
+  // REORG DETECTION
+  // ===========================================================================
+
+  /**
+   * Detect and handle chain reorganization.
+   * Compares stored block hashes with daemon's chain to find divergence.
+   *
+   * Reference: Salvium wallet2.cpp pull_blocks() reorg detection
+   * @private
+   */
+  async _detectReorg() {
+    if (this.startHeight === 0) return;
+
+    // Check if our stored tip hash matches the daemon's hash at that height
+    const checkHeight = this.startHeight - 1;
+    const storedHash = await this.storage.getBlockHash(checkHeight);
+
+    if (!storedHash) return; // No stored hash = first sync, no reorg possible
+
+    try {
+      const response = await this.daemon.getBlockHeaderByHeight(checkHeight);
+      if (!response.success) return;
+
+      const daemonHash = response.result.block_header?.hash;
+      if (!daemonHash || storedHash === daemonHash) return; // No reorg
+
+      // Hashes differ - find common ancestor
+      const commonHeight = await this._findCommonAncestor(checkHeight);
+      await this._handleWalletReorg(commonHeight, checkHeight);
+    } catch (e) {
+      // If we can't detect, proceed with normal sync
+      console.error('Reorg detection failed:', e.message);
+    }
+  }
+
+  /**
+   * Find the common ancestor height by walking backward.
+   * @private
+   * @param {number} fromHeight - Start searching from this height
+   * @returns {Promise<number>} Highest height where hashes match
+   */
+  async _findCommonAncestor(fromHeight) {
+    for (let h = fromHeight; h >= 0; h--) {
+      const storedHash = await this.storage.getBlockHash(h);
+      if (!storedHash) return h; // No stored hash below this = safe starting point
+
+      try {
+        const response = await this.daemon.getBlockHeaderByHeight(h);
+        if (!response.success) continue;
+
+        const daemonHash = response.result.block_header?.hash;
+        if (storedHash === daemonHash) return h;
+      } catch (e) {
+        continue;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Handle wallet-level reorg: invalidate orphaned data and rescan.
+   * @private
+   * @param {number} commonHeight - Last valid block height
+   * @param {number} oldTipHeight - Previous sync tip height
+   */
+  async _handleWalletReorg(commonHeight, oldTipHeight) {
+    const blocksRolledBack = oldTipHeight - commonHeight;
+
+    this._emit('reorg', {
+      commonHeight,
+      oldTipHeight,
+      blocksRolledBack
+    });
+
+    // Invalidate all wallet data above the common ancestor
+    await this.storage.deleteOutputsAbove(commonHeight);
+    await this.storage.deleteTransactionsAbove(commonHeight);
+    await this.storage.unspendOutputsAbove(commonHeight);
+    await this.storage.deleteBlockHashesAbove(commonHeight);
+
+    // Reset sync height to rescan from common ancestor
+    this.startHeight = commonHeight + 1;
+    this.currentHeight = commonHeight + 1;
+    await this.storage.setSyncHeight(this.startHeight);
+  }
+
+  // ===========================================================================
   // BATCH PROCESSING
   // ===========================================================================
 
@@ -303,6 +393,7 @@ export class WalletSync {
         for (const header of batch) {
           if (this._stopRequested) break;
           await this._processBlock(header);
+          await this.storage.putBlockHash(header.height, header.hash);
           this.currentHeight = header.height + 1;
           this._emit('syncProgress', this.getProgress());
         }
@@ -318,6 +409,7 @@ export class WalletSync {
         const blockData = blocks[j];
 
         await this._processBlockFromBatch(header, blockData);
+        await this.storage.putBlockHash(header.height, header.hash);
         this.currentHeight = header.height + 1;
         this._emit('syncProgress', this.getProgress());
       }

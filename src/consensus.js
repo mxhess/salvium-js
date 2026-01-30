@@ -72,6 +72,8 @@ export const FEE_PER_BYTE = 30n;
 export const DYNAMIC_FEE_PER_KB_BASE_FEE = 200000n;
 export const DYNAMIC_FEE_PER_KB_BASE_BLOCK_REWARD = 1000000000n; // 10 * 10^8
 export const DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT = 3000n;
+export const CRYPTONOTE_SCALING_2021_FEE_ROUNDING_PLACES = 2;
+export const FEE_ESTIMATE_GRACE_BLOCKS = 10;
 export const PER_KB_FEE_QUANTIZATION_DECIMALS = 8;
 export const DEFAULT_DUST_THRESHOLD = 2000000000n; // 2 * 10^9
 export const BASE_REWARD_CLAMP_THRESHOLD = 100000000n; // 10^8
@@ -686,12 +688,36 @@ export function getMinimumFee(txWeight, baseReward, version = 1) {
 }
 
 /**
- * Calculate dynamic fee based on block reward
+ * Calculate dynamic base fee per byte.
+ * Reference: blockchain.cpp get_dynamic_base_fee()
+ *
+ * Formula: fee_per_byte = 0.95 * (block_reward * REFERENCE_TX_WEIGHT) / (median_weight²)
+ *
+ * @param {bigint} baseReward - Current block reward
+ * @param {number} medianBlockWeight - Effective median block weight
+ * @param {number} version - Hard fork version
+ * @returns {bigint} Dynamic fee per byte
+ */
+export function getDynamicBaseFee(baseReward, medianBlockWeight, version = 1) {
+  const minWeight = version >= 5 ? CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5 : 300000;
+  const effectiveMedian = Math.max(medianBlockWeight, minWeight);
+  const median = BigInt(effectiveMedian);
+
+  // fee_per_byte = block_reward * REFERENCE_TX_WEIGHT / median² * 0.95
+  const feePerByte = baseReward * DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT / (median * median);
+
+  // Apply 5% reduction (0.95x) — C++ does: lo -= lo / 20
+  return feePerByte - feePerByte / 20n;
+}
+
+/**
+ * Calculate dynamic fee for a given transaction weight (legacy wrapper).
  *
  * @param {bigint} baseReward - Current block reward
  * @param {number} txWeight - Transaction weight
  * @param {number} version - Hard fork version
  * @returns {bigint} Dynamic fee
+ * @deprecated Use getDynamicBaseFee() for per-byte fee, then multiply by weight
  */
 export function getDynamicFee(baseReward, txWeight, version = 1) {
   const fee = DYNAMIC_FEE_PER_KB_BASE_FEE * BigInt(txWeight) / 1024n;
@@ -711,6 +737,50 @@ export function getDynamicFee(baseReward, txWeight, version = 1) {
  * @param {bigint} fee - Raw fee
  * @returns {bigint} Quantized fee
  */
+/**
+ * Compute 2021-scaling dynamic fee tiers.
+ * Reference: blockchain.cpp get_dynamic_base_fee_estimate_2021_scaling()
+ *
+ * Returns 4 fee-per-byte values for priority levels [Low, Normal, Medium, High].
+ *
+ * @param {bigint} baseReward - Current block reward
+ * @param {number} shortTermMedian - Short-term effective median block weight (Mnw)
+ * @param {number} longTermMedian - Long-term effective median block weight (Mlw)
+ * @returns {bigint[]} Array of 4 fee-per-byte values [Fl, Fn, Fm, Fh]
+ */
+export function getDynamicBaseFee2021Scaling(baseReward, shortTermMedian, longTermMedian) {
+  const FRZ = BigInt(CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5);
+  const REF = DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT;
+
+  const Mnw = BigInt(shortTermMedian);
+  const Mlw = BigInt(longTermMedian);
+  const Mfw = Mnw < Mlw ? Mnw : Mlw; // min(Mnw, Mlw)
+
+  // Prevent division by zero
+  const safeMfw = Mfw > 0n ? Mfw : FRZ;
+
+  // Fl (Low): base_reward * ref_weight / Mfw²
+  const Fl = baseReward * REF / (safeMfw * safeMfw);
+
+  // Fn (Normal): 4 * base_reward * ref_weight / Mfw²
+  const Fn = 4n * baseReward * REF / (safeMfw * safeMfw);
+
+  // Fm (Medium): 16 * base_reward * ref_weight / (FRZ * Mfw)
+  const Fm = 16n * baseReward * REF / (FRZ * safeMfw);
+
+  // Fh (High): max(4 * Fm, 4 * Fm * Mfw / (32 * ref_weight * Mnw / FRZ))
+  const safeMnw = Mnw > 0n ? Mnw : FRZ;
+  const denom = 32n * REF * safeMnw / FRZ;
+  const FhAlt = denom > 0n ? 4n * Fm * safeMfw / denom : 4n * Fm;
+  const Fh = FhAlt > 4n * Fm ? FhAlt : 4n * Fm;
+
+  // Round up to CRYPTONOTE_SCALING_2021_FEE_ROUNDING_PLACES (2 decimal places = 100)
+  const rounding = 10n ** BigInt(CRYPTONOTE_SCALING_2021_FEE_ROUNDING_PLACES);
+  const roundUp = (v) => ((v + rounding - 1n) / rounding) * rounding;
+
+  return [roundUp(Fl), roundUp(Fn), roundUp(Fm), roundUp(Fh)];
+}
+
 export function quantizeFee(fee) {
   const mask = (10n ** BigInt(PER_KB_FEE_QUANTIZATION_DECIMALS)) - 1n;
   return ((fee + mask) / (mask + 1n)) * (mask + 1n);
@@ -857,6 +927,301 @@ export function validateRingSize(ringSize, version = 1) {
   return { valid: true };
 }
 
+// Short-term weight window (for block reward median)
+export const CRYPTONOTE_REWARD_BLOCKS_WINDOW = 100;
+
+// =============================================================================
+// CHAIN STATE MANAGEMENT
+// =============================================================================
+
+/**
+ * Build cumulative difficulty array from individual difficulties
+ * @param {bigint[]} difficulties - Array of per-block difficulties
+ * @returns {bigint[]} Cumulative difficulties
+ */
+export function buildCumulativeDifficulties(difficulties) {
+  const result = [];
+  let cumulative = 0n;
+  for (const d of difficulties) {
+    cumulative += BigInt(d);
+    result.push(cumulative);
+  }
+  return result;
+}
+
+/**
+ * Compute median of a numeric array
+ * @param {number[]} values - Array of numbers
+ * @returns {number} Median value (floor for even-length arrays)
+ */
+export function getMedianBlockWeight(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return Math.floor((sorted[mid - 1] + sorted[mid]) / 2);
+  }
+  return sorted[mid];
+}
+
+// =============================================================================
+// DYNAMIC BLOCK SIZE SCALING
+// =============================================================================
+
+/**
+ * Calculate the long-term block weight for a given block.
+ * Clamps the block weight to within ±70% of the long-term median.
+ *
+ * Formula: min(max(blockWeight, Ml*10/17), Ml + Ml*7/10)
+ * Reference: blockchain.cpp:5518-5542
+ *
+ * @param {number} blockWeight - Actual block weight in bytes
+ * @param {number} longTermMedian - Long-term median block weight
+ * @returns {number} Clamped long-term block weight
+ */
+export function getNextLongTermBlockWeight(blockWeight, longTermMedian) {
+  const effectiveMedian = Math.max(CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5, longTermMedian);
+  const lowerBound = Math.floor(effectiveMedian * 10 / 17);
+  const upperBound = effectiveMedian + Math.floor(effectiveMedian * 7 / 10);
+  return Math.min(Math.max(blockWeight, lowerBound), upperBound);
+}
+
+/**
+ * Calculate the effective median block weight and block limit.
+ *
+ * Uses long-term (100k blocks) and short-term (100 blocks) medians
+ * to determine the dynamic block size limit.
+ *
+ * Reference: blockchain.cpp:5545-5608
+ *
+ * @param {number[]} longTermWeights - Long-term block weights (up to 100k entries)
+ * @param {number[]} shortTermWeights - Short-term block weights (last 100 entries)
+ * @param {number} hfVersion - Hard fork version
+ * @returns {{ longTermEffectiveMedian: number, effectiveMedian: number, blockLimit: number }}
+ */
+export function getEffectiveMedianBlockWeight(longTermWeights, shortTermWeights, hfVersion = 1) {
+  const fullRewardZone = getMinBlockWeight(hfVersion);
+
+  // Long-term median
+  let longTermMedian;
+  if (longTermWeights.length === 0) {
+    longTermMedian = CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5;
+  } else {
+    longTermMedian = getMedianBlockWeight(longTermWeights);
+  }
+
+  const longTermEffectiveMedian = Math.max(
+    CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5,
+    longTermMedian
+  );
+
+  // Short-term median
+  const shortTermMedian = shortTermWeights.length > 0
+    ? getMedianBlockWeight(shortTermWeights)
+    : 0;
+
+  // Effective median: clamp(max(longTerm, shortTerm), longTerm, 50*longTerm)
+  let effectiveMedian = Math.max(longTermEffectiveMedian, shortTermMedian);
+  effectiveMedian = Math.min(
+    effectiveMedian,
+    CRYPTONOTE_SHORT_TERM_BLOCK_WEIGHT_SURGE_FACTOR * longTermEffectiveMedian
+  );
+
+  // Ensure at least full reward zone
+  effectiveMedian = Math.max(effectiveMedian, fullRewardZone);
+
+  // Block limit = 2 * effective median
+  const blockLimit = effectiveMedian * 2;
+
+  return { longTermEffectiveMedian, effectiveMedian, blockLimit };
+}
+
+/**
+ * Chain state manager for tracking block data needed by consensus functions.
+ * Maintains rolling windows of timestamps, difficulties, and block weights.
+ */
+export class ChainState {
+  constructor() {
+    this.height = 0;
+    this.timestamps = [];
+    this.cumulativeDifficulties = [];
+    this.blockWeights = [];           // actual block weights
+    this.longTermBlockWeights = [];   // clamped long-term weights
+    this.blockHashes = [];            // block hash at each height
+  }
+
+  /**
+   * Add a new block to the chain state
+   * @param {number} timestamp - Block timestamp
+   * @param {bigint} difficulty - Block difficulty
+   * @param {number} weight - Block weight in bytes
+   * @param {string} [blockHash] - Block hash (hex string)
+   */
+  addBlock(timestamp, difficulty, weight, blockHash = null) {
+    this.timestamps.push(timestamp);
+
+    const prevCumDiff = this.cumulativeDifficulties.length > 0
+      ? this.cumulativeDifficulties[this.cumulativeDifficulties.length - 1]
+      : 0n;
+    this.cumulativeDifficulties.push(prevCumDiff + BigInt(difficulty));
+
+    this.blockWeights.push(weight);
+    this.blockHashes.push(blockHash);
+
+    // Compute clamped long-term weight
+    const ltMedian = this.longTermBlockWeights.length > 0
+      ? getMedianBlockWeight(this.longTermBlockWeights.slice(
+          -CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE
+        ))
+      : 0;
+    const ltWeight = this.height < CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE
+      ? weight
+      : getNextLongTermBlockWeight(weight, ltMedian);
+    this.longTermBlockWeights.push(ltWeight);
+
+    this.height++;
+  }
+
+  /**
+   * Pop the top block from the chain state.
+   * Reference: blockchain.cpp pop_block_from_blockchain()
+   * @returns {{ timestamp: number, difficulty: bigint, weight: number, blockHash: string|null }} Popped block data
+   */
+  popBlock() {
+    if (this.height === 0) {
+      throw new Error('Cannot pop from empty chain');
+    }
+
+    const timestamp = this.timestamps.pop();
+    const cumDiff = this.cumulativeDifficulties.pop();
+    const prevCumDiff = this.cumulativeDifficulties.length > 0
+      ? this.cumulativeDifficulties[this.cumulativeDifficulties.length - 1]
+      : 0n;
+    const difficulty = cumDiff - prevCumDiff;
+    const weight = this.blockWeights.pop();
+    this.longTermBlockWeights.pop();
+    const blockHash = this.blockHashes.pop();
+
+    this.height--;
+
+    return { timestamp, difficulty, weight, blockHash };
+  }
+
+  /**
+   * Rollback chain state to a target height.
+   * Pops all blocks above targetHeight.
+   * Reference: blockchain.cpp rollback_blockchain_switching()
+   * @param {number} targetHeight - Height to rollback to
+   * @returns {Array} Array of popped block data (newest first)
+   */
+  rollbackToHeight(targetHeight) {
+    if (targetHeight < 0 || targetHeight > this.height) {
+      throw new Error(`Invalid rollback target: ${targetHeight} (current height: ${this.height})`);
+    }
+
+    const popped = [];
+    while (this.height > targetHeight) {
+      popped.push(this.popBlock());
+    }
+    return popped;
+  }
+
+  /**
+   * Get block hash at a given height
+   * @param {number} height - Block height
+   * @returns {string|null} Block hash or null
+   */
+  getBlockHash(height) {
+    if (height < 0 || height >= this.height) return null;
+    return this.blockHashes[height];
+  }
+
+  /**
+   * Get the tip block hash
+   * @returns {string|null}
+   */
+  getTipHash() {
+    if (this.height === 0) return null;
+    return this.blockHashes[this.height - 1];
+  }
+
+  /**
+   * Check if a block hash exists in the main chain
+   * @param {string} hash - Block hash
+   * @returns {number} Height of block, or -1 if not found
+   */
+  findBlockByHash(hash) {
+    return this.blockHashes.lastIndexOf(hash);
+  }
+
+  /**
+   * Get difficulty calculation inputs for the appropriate window
+   * @param {number} version - Hard fork version (1 = legacy, 2+ = LWMA)
+   * @returns {{ timestamps: number[], cumulativeDifficulties: bigint[] }}
+   */
+  getDifficultyWindow(version = 2) {
+    const windowSize = version < 2
+      ? DIFFICULTY_WINDOW + 1
+      : DIFFICULTY_WINDOW_V2 + 1;
+    const start = Math.max(0, this.timestamps.length - windowSize);
+    return {
+      timestamps: this.timestamps.slice(start),
+      cumulativeDifficulties: this.cumulativeDifficulties.slice(start)
+    };
+  }
+
+  /**
+   * Get next difficulty for the chain
+   * @param {number} version - Hard fork version
+   * @returns {bigint}
+   */
+  getNextDifficulty(version = 2) {
+    const { timestamps, cumulativeDifficulties } = this.getDifficultyWindow(version);
+    if (version < 2) {
+      return nextDifficulty(timestamps, cumulativeDifficulties);
+    }
+    return nextDifficultyV2(timestamps, cumulativeDifficulties);
+  }
+
+  /**
+   * Get short-term block weights (last 100)
+   * @returns {number[]}
+   */
+  getShortTermWeights() {
+    return this.blockWeights.slice(-CRYPTONOTE_REWARD_BLOCKS_WINDOW);
+  }
+
+  /**
+   * Get long-term block weights (last 100k, clamped)
+   * @returns {number[]}
+   */
+  getLongTermWeights() {
+    return this.longTermBlockWeights.slice(-CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE);
+  }
+
+  /**
+   * Get the current dynamic block weight limit
+   * @param {number} hfVersion - Hard fork version
+   * @returns {{ longTermEffectiveMedian: number, effectiveMedian: number, blockLimit: number }}
+   */
+  getBlockWeightLimit(hfVersion = 1) {
+    return getEffectiveMedianBlockWeight(
+      this.getLongTermWeights(),
+      this.getShortTermWeights(),
+      hfVersion
+    );
+  }
+
+  /**
+   * Get cumulative difficulty at the tip
+   * @returns {bigint}
+   */
+  getCumulativeDifficulty() {
+    if (this.cumulativeDifficulties.length === 0) return 0n;
+    return this.cumulativeDifficulties[this.cumulativeDifficulties.length - 1];
+  }
+}
+
 // =============================================================================
 // EXPORTS
 // =============================================================================
@@ -898,4 +1263,17 @@ export default {
   validateBlockWeight,
   validateTxSize,
   validateRingSize,
+
+  // Chain state management
+  buildCumulativeDifficulties,
+  getMedianBlockWeight,
+  getNextLongTermBlockWeight,
+  getEffectiveMedianBlockWeight,
+  ChainState,
+
+  // Fee estimation
+  getDynamicBaseFee,
+  getDynamicBaseFee2021Scaling,
+  CRYPTONOTE_SCALING_2021_FEE_ROUNDING_PLACES,
+  FEE_ESTIMATE_GRACE_BLOCKS,
 };

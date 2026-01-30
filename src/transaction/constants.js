@@ -227,6 +227,8 @@ export const FEE_PRIORITY = {
  * @returns {bigint} Multiplier
  */
 export function getFeeMultiplier(priority) {
+  // C++ wallet2.cpp: priority 0 defaults to priority 2 (Normal) for fee algorithm >= 2
+  if (priority === 0) priority = 2;
   if (priority < 1) priority = 1;
   if (priority > 4) priority = 4;
   return FEE_MULTIPLIERS[priority - 1];

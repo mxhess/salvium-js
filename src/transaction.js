@@ -1238,8 +1238,9 @@ export function estimateTxSize(numInputs, ringSize, numOutputs, extraSize = 0, o
   size += 1 + 6; // version + unlock_time varint
 
   // Inputs
-  // vin: type(1) + amount varint + key_offsets (count + values) + key_image(32)
-  const inputSize = 1 + 6 + 4 + ringSize * 4 + 32;
+  // vin: type(1) + amount varint(6) + key_offsets count(4) + key_offsets values(ringSize*2) + key_image(32)
+  // C++ wallet2.cpp: n_inputs * (1+6+4+(mixin+1)*2+32) where mixin+1 = ringSize
+  const inputSize = 1 + 6 + 4 + ringSize * 2 + 32;
   size += inputSize * numInputs;
 
   // Outputs
@@ -1254,14 +1255,15 @@ export function estimateTxSize(numInputs, ringSize, numOutputs, extraSize = 0, o
   size += 1;
 
   // Bulletproof(+) range proof
+  // C++ wallet2.cpp: (2 * (6 + log_padded_outputs) + (bp_plus ? 6 : (4+5))) * 32 + 3
   if (bulletproofPlus) {
-    // BP+ size: 32 * (6 + 2*ceil(log2(numOutputs)))
-    const log2Outputs = Math.ceil(Math.log2(Math.max(numOutputs, 1)));
-    size += 32 * (6 + 2 * log2Outputs);
+    let log2Outputs = 0;
+    while ((1 << log2Outputs) < numOutputs) log2Outputs++;
+    size += (2 * (6 + log2Outputs) + 6) * 32 + 3;
   } else {
-    // Original BP: 32 * (9 + 2*ceil(log2(numOutputs)))
-    const log2Outputs = Math.ceil(Math.log2(Math.max(numOutputs, 1)));
-    size += 32 * (9 + 2 * log2Outputs);
+    let log2Outputs = 0;
+    while ((1 << log2Outputs) < numOutputs) log2Outputs++;
+    size += (2 * (6 + log2Outputs) + 9) * 32 + 3;
   }
 
   // Ring signatures (CLSAG)
@@ -1308,14 +1310,15 @@ export function estimateTxWeight(numInputs, ringSize, numOutputs, extraSize = 0,
   const { bulletproofPlus = true } = options;
 
   // Apply clawback for > 2 outputs
+  // C++ wallet2.cpp: bp_base = (32 * ((plus ? 6 : 9) + 7 * 2)) / 2
   if (numOutputs > 2) {
-    const bpBase = 32 * (bulletproofPlus ? 6 : 9) / 2;
-    const logPaddedOutputs = Math.ceil(Math.log2(numOutputs));
+    const bpBase = (32 * ((bulletproofPlus ? 6 : 9) + 7 * 2)) / 2;
+    let logPaddedOutputs = 2;
+    while ((1 << logPaddedOutputs) < numOutputs) logPaddedOutputs++;
     const paddedOutputs = 1 << logPaddedOutputs;
-    const nlr = 2 * logPaddedOutputs;
+    const nlr = 2 * (6 + logPaddedOutputs);
     const bpSize = 32 * ((bulletproofPlus ? 6 : 9) + nlr);
 
-    // Clawback: what we'd pay for individual proofs minus what we actually need
     const bpClawback = Math.floor((bpBase * paddedOutputs - bpSize) * 4 / 5);
     weight += bpClawback;
   }
@@ -2380,10 +2383,12 @@ export function estimateTransactionFee(numInputs, numOutputs, options = {}) {
   const {
     priority = 'default',
     ringSize = DEFAULT_RING_SIZE,
-    baseFee = FEE_PER_KB
+    baseFee = FEE_PER_BYTE,
+    feeQuantizationMask = 0n
   } = options;
 
   // Convert string priority to number
+  // C++ wallet2.cpp: priority 0 maps to priority 2 (Normal) for fee algorithm >= 2
   let priorityNum;
   if (typeof priority === 'string') {
     switch (priority.toLowerCase()) {
@@ -2393,17 +2398,14 @@ export function estimateTransactionFee(numInputs, numOutputs, options = {}) {
       default: priorityNum = FEE_PRIORITY.NORMAL; break;
     }
   } else {
-    priorityNum = priority;
+    priorityNum = priority === 0 ? FEE_PRIORITY.NORMAL : priority;
   }
 
-  // Estimate transaction size
-  const size = estimateTxSize(numInputs, ringSize, numOutputs, 0, { bulletproofPlus: true });
-
-  // Get fee multiplier for priority
+  // Use per-byte weight-based fee (matches C++ wallet2::estimate_fee with use_per_byte_fee=true)
+  const weight = estimateTxWeight(numInputs, ringSize, numOutputs, 0, { bulletproofPlus: true });
   const multiplier = getFeeMultiplier(priorityNum);
 
-  // Calculate fee (size is already a number from estimateTxSize)
-  return calculateFeeFromSize(baseFee * BigInt(multiplier), size);
+  return calculateFeeFromWeight(baseFee * multiplier, BigInt(weight), feeQuantizationMask);
 }
 
 /**

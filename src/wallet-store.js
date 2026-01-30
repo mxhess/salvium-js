@@ -71,6 +71,16 @@ export class WalletStorage {
   async setSyncHeight(height) { throw new Error('Not implemented'); }
   async getState(key) { throw new Error('Not implemented'); }
   async setState(key, value) { throw new Error('Not implemented'); }
+
+  // Block hash tracking (for reorg detection)
+  async putBlockHash(height, hash) { throw new Error('Not implemented'); }
+  async getBlockHash(height) { throw new Error('Not implemented'); }
+  async deleteBlockHashesAbove(height) { throw new Error('Not implemented'); }
+
+  // Reorg rollback operations
+  async deleteOutputsAbove(height) { throw new Error('Not implemented'); }
+  async deleteTransactionsAbove(height) { throw new Error('Not implemented'); }
+  async unspendOutputsAbove(height) { throw new Error('Not implemented'); }
 }
 
 // ============================================================================
@@ -332,6 +342,7 @@ export class MemoryStorage extends WalletStorage {
     this._keyImages = new Map();      // keyImage -> { txHash, outputIndex }
     this._spentKeyImages = new Set(); // Set of spent key images
     this._state = new Map();          // Generic key-value state
+    this._blockHashes = new Map();    // height -> blockHash
     this._syncHeight = 0;
     this._isOpen = false;
   }
@@ -350,6 +361,7 @@ export class MemoryStorage extends WalletStorage {
     this._keyImages.clear();
     this._spentKeyImages.clear();
     this._state.clear();
+    this._blockHashes.clear();
     this._syncHeight = 0;
   }
 
@@ -451,6 +463,52 @@ export class MemoryStorage extends WalletStorage {
     this._state.set(key, value);
   }
 
+  // Block hash tracking
+  async putBlockHash(height, hash) {
+    this._blockHashes.set(height, hash);
+  }
+
+  async getBlockHash(height) {
+    return this._blockHashes.get(height) || null;
+  }
+
+  async deleteBlockHashesAbove(height) {
+    for (const h of this._blockHashes.keys()) {
+      if (h > height) this._blockHashes.delete(h);
+    }
+  }
+
+  // Reorg rollback operations
+  async deleteOutputsAbove(height) {
+    for (const [key, output] of this._outputs) {
+      if (output.blockHeight !== null && output.blockHeight > height) {
+        this._outputs.delete(key);
+        this._keyImages.delete(key);
+        this._spentKeyImages.delete(key);
+      }
+    }
+  }
+
+  async deleteTransactionsAbove(height) {
+    for (const [key, tx] of this._transactions) {
+      if (tx.blockHeight !== null && tx.blockHeight > height) {
+        this._transactions.delete(key);
+      }
+    }
+  }
+
+  async unspendOutputsAbove(height) {
+    for (const output of this._outputs.values()) {
+      if (output.isSpent && output.spentHeight !== null && output.spentHeight > height) {
+        output.isSpent = false;
+        output.spentTxHash = null;
+        output.spentHeight = null;
+        output.updatedAt = Date.now();
+        this._spentKeyImages.delete(output.keyImage);
+      }
+    }
+  }
+
   // Query helpers
   _matchesQuery(output, query) {
     if (query.isSpent !== undefined && output.isSpent !== query.isSpent) return false;
@@ -535,6 +593,11 @@ export class IndexedDBStorage extends WalletStorage {
         if (!db.objectStoreNames.contains('state')) {
           db.createObjectStore('state', { keyPath: 'key' });
         }
+
+        // Block hashes store (for reorg detection)
+        if (!db.objectStoreNames.contains('blockHashes')) {
+          db.createObjectStore('blockHashes', { keyPath: 'height' });
+        }
       };
     });
   }
@@ -547,11 +610,10 @@ export class IndexedDBStorage extends WalletStorage {
   }
 
   async clear() {
-    const tx = this._db.transaction(['outputs', 'transactions', 'keyImages', 'state'], 'readwrite');
-    tx.objectStore('outputs').clear();
-    tx.objectStore('transactions').clear();
-    tx.objectStore('keyImages').clear();
-    tx.objectStore('state').clear();
+    const stores = ['outputs', 'transactions', 'keyImages', 'state'];
+    if (this._db.objectStoreNames.contains('blockHashes')) stores.push('blockHashes');
+    const tx = this._db.transaction(stores, 'readwrite');
+    for (const name of stores) tx.objectStore(name).clear();
     return new Promise((resolve, reject) => {
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
@@ -740,6 +802,109 @@ export class IndexedDBStorage extends WalletStorage {
     return new Promise((resolve, reject) => {
       const tx = this._db.transaction('state', 'readwrite');
       tx.objectStore('state').put({ key, value });
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // Block hash tracking
+  async putBlockHash(height, hash) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction('blockHashes', 'readwrite');
+      tx.objectStore('blockHashes').put({ height, hash });
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async getBlockHash(height) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction('blockHashes', 'readonly');
+      const request = tx.objectStore('blockHashes').get(height);
+      request.onsuccess = () => resolve(request.result?.hash || null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async deleteBlockHashesAbove(height) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction('blockHashes', 'readwrite');
+      const store = tx.objectStore('blockHashes');
+      const range = IDBKeyRange.lowerBound(height, true);
+      const request = store.openCursor(range);
+      request.onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // Reorg rollback operations
+  async deleteOutputsAbove(height) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction(['outputs', 'keyImages'], 'readwrite');
+      const outputStore = tx.objectStore('outputs');
+      const kiStore = tx.objectStore('keyImages');
+      const index = outputStore.index('blockHeight');
+      const range = IDBKeyRange.lowerBound(height, true);
+      const request = index.openCursor(range);
+      request.onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+          const keyImage = cursor.value.keyImage;
+          cursor.delete();
+          if (keyImage) kiStore.delete(keyImage);
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async deleteTransactionsAbove(height) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction('transactions', 'readwrite');
+      const store = tx.objectStore('transactions');
+      const index = store.index('blockHeight');
+      const range = IDBKeyRange.lowerBound(height, true);
+      const request = index.openCursor(range);
+      request.onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async unspendOutputsAbove(height) {
+    return new Promise((resolve, reject) => {
+      const tx = this._db.transaction('outputs', 'readwrite');
+      const store = tx.objectStore('outputs');
+      const request = store.openCursor();
+      request.onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+          const data = cursor.value;
+          if (data.isSpent && data.spentHeight !== null && data.spentHeight > height) {
+            data.isSpent = false;
+            data.spentTxHash = null;
+            data.spentHeight = null;
+            data.updatedAt = Date.now();
+            cursor.update(data);
+          }
+          cursor.continue();
+        }
+      };
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
     });
