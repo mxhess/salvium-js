@@ -3,6 +3,11 @@ node_modules/
 build/
 TODO
 
+# Rust/WASM build artifacts
+crates/*/target/
+src/crypto/wasm/package.json
+src/crypto/wasm/*.wasm.d.ts
+
 # Secrets - NEVER commit these
 .env
 .env.*

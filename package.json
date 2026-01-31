@@ -33,7 +33,8 @@
   },
   "scripts": {
     "test": "node test/run.js",
-    "build:wasm": "asc assembly/index.ts --outFile build/randomx.wasm --optimize --enable simd --initialMemory 16 --maximumMemory 8192"
+    "build:wasm": "asc assembly/index.ts --outFile build/randomx.wasm --optimize --enable simd --initialMemory 16 --maximumMemory 8192",
+    "build:wasm-crypto": "cd crates/salvium-crypto && PATH=\"$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH\" RUSTUP_HOME=\"$HOME/.rustup\" CARGO_HOME=\"$HOME/.cargo\" wasm-pack build --target web --out-dir ../../src/crypto/wasm"
   },
   "files": [
     "src/",

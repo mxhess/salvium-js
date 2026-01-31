@@ -1,0 +1,18 @@
+[package]
+name = "salvium-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "WASM crypto primitives for salvium-js"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+blake2b_simd = "1.0"
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
