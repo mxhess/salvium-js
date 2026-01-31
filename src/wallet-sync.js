@@ -610,7 +610,13 @@ export class WalletSync {
 
       if (txsResponse.success && txsResponse.result.txs) {
         for (const txData of txsResponse.result.txs) {
-          await this._processTransaction(txData, header, { isMinerTx: false, isProtocolTx: false });
+          if (txData.as_hex) {
+            await this._processTransaction(txData, header, { isMinerTx: false, isProtocolTx: false });
+          } else if (txData.as_json) {
+            // Fallback for testnet/in-memory nodes that don't have binary serialization
+            const txJson = typeof txData.as_json === 'string' ? JSON.parse(txData.as_json) : txData.as_json;
+            await this._processEmbeddedTransaction(txJson, txData.tx_hash, header, { isMinerTx: false, isProtocolTx: false });
+          }
         }
       }
     }

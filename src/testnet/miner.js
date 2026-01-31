@@ -106,8 +106,14 @@ export class TestnetMiner {
     const { tx: protocolTx, txHash: protocolTxHash } =
       createEmptyProtocolTransaction(height);
 
-    // Drain mempool
+    // Drain mempool (user transactions)
     const mempoolTxs = this.node.drainMempool();
+
+    // Collect user transaction hashes for the block (as Uint8Array for merkle tree)
+    const userTxHashes = mempoolTxs.map(mtx => {
+      const h = mtx._meta?.txHash || mtx.txHash;
+      return typeof h === 'string' ? hexToBytes(h) : h;
+    });
 
     // Assemble block
     const prevHash = height > 0
@@ -122,14 +128,15 @@ export class TestnetMiner {
       nonce: 0,
       miner_tx: minerTx,
       protocol_tx: protocolTx,
-      tx_hashes: [],
+      tx_hashes: userTxHashes,
     };
 
     // Build hashing blob for PoW
     // Transaction hashes for tree: [minerTxHash, protocolTxHash, ...mempoolTxHashes]
     const allTxHashes = [minerTxHash, protocolTxHash];
     for (const mtx of mempoolTxs) {
-      allTxHashes.push(mtx.txHash);
+      const h = mtx._meta?.txHash || mtx.txHash;
+      allTxHashes.push(typeof h === 'string' ? hexToBytes(h) : h);
     }
 
     const hashingBlob = constructBlockHashingBlob(block, allTxHashes);
@@ -155,10 +162,38 @@ export class TestnetMiner {
     const blockHashBytes = getBlockHash(block);
     const blockHash = bytesToHex(blockHashBytes);
 
+    // Build user transaction data for the node
+    const userTxs = mempoolTxs.map(mtx => {
+      const txHashHex = typeof (mtx._meta?.txHash || mtx.txHash) === 'string'
+        ? (mtx._meta?.txHash || mtx.txHash)
+        : bytesToHex(mtx._meta?.txHash || mtx.txHash);
+      return {
+        txHash: txHashHex,
+        keyImages: mtx._meta?.keyImages || [],
+        outputs: (mtx.prefix?.vout || []).map((vout, i) => ({
+          key: typeof vout.target === 'string' ? vout.target : bytesToHex(vout.target),
+          mask: mtx.rct?.outPk?.[i] || null,
+          commitment: mtx.rct?.outPk?.[i] || null,
+        })),
+        tx: mtx,
+      };
+    });
+
+    // Store user transactions for lookup
+    for (const utx of userTxs) {
+      this.node.txsByHash.set(utx.txHash, {
+        tx: utx.tx,
+        txHash: utx.txHash,
+        blockHeight: height,
+        txSecretKey: utx.tx._meta?.txSecretKey || null,
+      });
+    }
+
     // Add block to chain
     this.node.addBlock(block, blockHash, bytesToHex(minerTxHash), bytesToHex(protocolTxHash), {
       minerTx: { txSecretKey: bytesToHex(txSecretKey) },
       protocolTx: {},
+      userTxs,
     }, reward);
 
     return { height, hash: blockHash, reward };

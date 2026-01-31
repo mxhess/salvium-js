@@ -28,6 +28,12 @@ export class TestnetNode {
 
     /** @type {Array<Object>} Pending mempool transactions */
     this.mempool = [];
+
+    /** @type {Array<Object>} Global output index: { key, mask, height, txid, unlocked } */
+    this.globalOutputs = [];
+
+    /** @type {Set<string>} Spent key images (hex) */
+    this.spentKeyImages = new Set();
   }
 
   // ===========================================================================
@@ -78,6 +84,48 @@ export class TestnetNode {
         blockHeight: height,
         ...txData.protocolTx,
       });
+    }
+
+    // Index miner_tx outputs into globalOutputs
+    if (block.miner_tx?.outputs) {
+      for (const output of block.miner_tx.outputs) {
+        const key = typeof output.target === 'string' ? output.target : bytesToHex(output.target);
+        // Coinbase outputs have mask = identity (scalar 1)
+        const mask = output.commitment || '0100000000000000000000000000000000000000000000000000000000000000';
+        this.globalOutputs.push({
+          key,
+          mask,
+          height,
+          txid: minerTxHash,
+          unlocked: false,
+          commitment: output.commitment || null,
+        });
+      }
+    }
+
+    // Index user transaction outputs
+    if (entry.txData.userTxs) {
+      for (const utx of entry.txData.userTxs) {
+        // Record spent key images
+        if (utx.keyImages) {
+          for (const ki of utx.keyImages) {
+            this.spentKeyImages.add(ki);
+          }
+        }
+        // Index outputs
+        if (utx.outputs) {
+          for (const out of utx.outputs) {
+            this.globalOutputs.push({
+              key: out.key,
+              mask: out.mask || '0100000000000000000000000000000000000000000000000000000000000000',
+              height,
+              txid: utx.txHash,
+              unlocked: false,
+              commitment: out.commitment || null,
+            });
+          }
+        }
+      }
     }
   }
 
@@ -149,9 +197,12 @@ export class TestnetNode {
     const block = entry.block;
 
     // Build the JSON representation that WalletSync._processBlock expects
+    const txHashes = (block.tx_hashes || []).map(h =>
+      typeof h === 'string' ? h : bytesToHex(h)
+    );
     const blockJson = {
       miner_tx: this._txToJson(block.miner_tx, entry.txData.minerTx),
-      tx_hashes: [],
+      tx_hashes: txHashes,
     };
     if (block.protocol_tx) {
       blockJson.protocol_tx = this._txToJson(block.protocol_tx, entry.txData.protocolTx);
@@ -173,9 +224,12 @@ export class TestnetNode {
       if (h >= 0 && h < this.blocks.length) {
         const entry = this.blocks[h];
         const block = entry.block;
+        const txHashesHex = (block.tx_hashes || []).map(h =>
+          typeof h === 'string' ? h : bytesToHex(h)
+        );
         const blockJson = {
           miner_tx: this._txToJson(block.miner_tx, entry.txData.minerTx),
-          tx_hashes: [],
+          tx_hashes: txHashesHex,
         };
         if (block.protocol_tx) {
           blockJson.protocol_tx = this._txToJson(block.protocol_tx, entry.txData.protocolTx);
@@ -197,9 +251,18 @@ export class TestnetNode {
     for (const hash of hashes) {
       const stored = this.txsByHash.get(hash);
       if (stored) {
+        // Determine if this is a user TX (from buildTransaction) or internal TX
+        let txJson;
+        if (stored.tx?.prefix) {
+          // User transaction from buildTransaction()
+          txJson = this._userTxToJson(stored.tx);
+        } else {
+          // Internal TX (miner/protocol)
+          txJson = this._txToJson(stored.tx, stored);
+        }
         txs.push({
           tx_hash: hash,
-          as_json: JSON.stringify(this._txToJson(stored.tx, stored)),
+          as_json: JSON.stringify(txJson),
         });
       }
     }
@@ -211,8 +274,172 @@ export class TestnetNode {
   }
 
   // ===========================================================================
+  // Transaction Sending RPC Methods
+  // ===========================================================================
+
+  /**
+   * Get output keys and masks by global index (for ring member fetching)
+   * Matches daemon.getOuts() signature
+   */
+  async getOuts({ outputs, get_txid = false }) {
+    const outs = [];
+    for (const req of outputs) {
+      const idx = req.index;
+      if (idx >= 0 && idx < this.globalOutputs.length) {
+        const o = this.globalOutputs[idx];
+        const entry = {
+          key: o.key,
+          mask: o.mask,
+          unlocked: true, // Simplified: all outputs available as ring members
+          height: o.height,
+        };
+        if (get_txid) entry.txid = o.txid;
+        outs.push(entry);
+      } else {
+        outs.push({ key: '0'.repeat(64), mask: '0'.repeat(64), unlocked: false, height: 0 });
+      }
+    }
+    return { outs };
+  }
+
+  /**
+   * Get output distribution (cumulative output counts per block)
+   * Used by GammaPicker for decoy selection
+   */
+  async getOutputDistribution(amounts = [0], options = {}) {
+    // Build cumulative output count per block height
+    const distribution = [];
+    let cumulative = 0;
+    for (let h = 0; h < this.blocks.length; h++) {
+      // Count outputs added at this height
+      const outputsAtHeight = this.globalOutputs.filter(o => o.height === h).length;
+      cumulative += outputsAtHeight;
+      distribution.push(cumulative);
+    }
+
+    return {
+      distributions: [{
+        amount: 0,
+        start_height: 0,
+        base: 0,
+        distribution,
+      }],
+    };
+  }
+
+  /**
+   * Get output histogram (alternative format used by prepareInputs)
+   */
+  async getOutputHistogram({ amounts = [0] } = {}) {
+    const dist = await this.getOutputDistribution(amounts);
+    return {
+      histogram: [{
+        amount: 0,
+        recent_outputs_offsets: dist.distributions[0].distribution,
+      }],
+    };
+  }
+
+  /**
+   * Submit a raw transaction to the mempool
+   * For testnet, accepts tx object directly (no hex serialization needed)
+   */
+  async sendRawTransaction(txOrHex, options = {}) {
+    const tx = typeof txOrHex === 'string' ? JSON.parse(txOrHex) : txOrHex;
+
+    // Validate key images not already spent
+    const keyImages = tx._meta?.keyImages || [];
+    for (const ki of keyImages) {
+      if (this.spentKeyImages.has(ki)) {
+        return {
+          success: false,
+          error: { message: `Double spend: key image ${ki.slice(0, 16)}... already spent` },
+        };
+      }
+    }
+
+    this.mempool.push(tx);
+    return { success: true, result: { status: 'OK' } };
+  }
+
+  /**
+   * Check if key images are spent
+   */
+  async isKeyImageSpent(keyImages) {
+    const spentStatus = keyImages.map(ki => this.spentKeyImages.has(ki) ? 1 : 0);
+    return { spent_status: spentStatus };
+  }
+
+  /**
+   * Get the global output index for an output by txHash and outputIndex
+   */
+  getGlobalIndex(txHash, outputIndex) {
+    let idx = 0;
+    for (const o of this.globalOutputs) {
+      if (o.txid === txHash) {
+        if (outputIndex === 0) return idx;
+        outputIndex--;
+      }
+      idx++;
+    }
+    return -1;
+  }
+
+  // ===========================================================================
   // Internal: Convert internal tx format to JSON format WalletSync expects
   // ===========================================================================
+
+  /**
+   * Convert a buildTransaction() output to JSON format for wallet scanning
+   */
+  _userTxToJson(tx) {
+    if (!tx || !tx.prefix) return null;
+
+    const prefix = tx.prefix;
+    const json = {
+      version: prefix.version,
+      unlock_time: Number(prefix.unlockTime || 0),
+      vin: (prefix.vin || []).map(input => {
+        if (input.type === 'gen' || input.type === 0xff) {
+          return { gen: { height: input.height || 0 } };
+        }
+        return {
+          key: {
+            amount: Number(input.amount || 0),
+            key_offsets: (input.keyOffsets || []).map(Number),
+            k_image: typeof input.keyImage === 'string'
+              ? input.keyImage
+              : bytesToHex(input.keyImage),
+          },
+        };
+      }),
+      vout: (prefix.vout || []).map(output => ({
+        amount: 0, // RingCT: always 0
+        target: {
+          key: typeof output.target === 'string' ? output.target : bytesToHex(output.target),
+        },
+      })),
+      extra: [],
+      rct_signatures: {
+        type: tx.rct?.type || 0,
+        txnFee: Number(tx.rct?.fee || 0),
+        ecdhInfo: (tx.rct?.ecdhInfo || []).map(e =>
+          typeof e === 'string' ? { amount: e } : e
+        ),
+        outPk: tx.rct?.outPk || [],
+      },
+    };
+
+    // Extra: tx pubkey
+    if (prefix.extra?.txPubKey) {
+      const pkHex = typeof prefix.extra.txPubKey === 'string'
+        ? prefix.extra.txPubKey : bytesToHex(prefix.extra.txPubKey);
+      const pkBytes = hexToBytes(pkHex);
+      json.extra = [0x01, ...pkBytes];
+    }
+
+    return json;
+  }
 
   /**
    * Convert a tx object to the JSON representation that WalletSync parses

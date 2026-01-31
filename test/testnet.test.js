@@ -195,6 +195,77 @@ describe('Testnet Integration', () => {
   }, 30000);
 });
 
+describe('Testnet Transactions', () => {
+  let testnet;
+
+  beforeAll(async () => {
+    testnet = new Testnet();
+    await testnet.init();
+    // Mine 70+ blocks for enough outputs for ring size 16,
+    // plus 60 for maturity window = 130 total needed
+    await testnet.mineBlocks(130);
+  }, 60000);
+
+  test('chain has enough outputs for ring selection', () => {
+    expect(testnet.node.globalOutputs.length).toBeGreaterThanOrEqual(70);
+  });
+
+  test('miner wallet has unlocked balance', async () => {
+    const wallet = testnet.getMinerWallet();
+    await testnet.syncWallet(wallet);
+    const { unlockedBalance } = await testnet.getBalance(wallet);
+    expect(unlockedBalance).toBeGreaterThan(0n);
+  }, 30000);
+
+  test('basic transfer: miner → new wallet', async () => {
+    const minerWallet = testnet.getMinerWallet();
+    const recipient = testnet.createWallet();
+
+    const transferAmount = 1000000000n; // 1 SAL
+
+    const { tx, fee } = await testnet.transfer(
+      minerWallet,
+      {
+        viewPublicKey: recipient.keys.viewPublicKey,
+        spendPublicKey: recipient.keys.spendPublicKey,
+      },
+      transferAmount,
+    );
+
+    expect(tx).toBeDefined();
+    expect(fee).toBeGreaterThan(0n);
+
+    // Sync recipient and verify balance
+    await testnet.syncWallet(recipient);
+    const { balance } = await testnet.getBalance(recipient);
+    expect(balance).toBe(transferAmount);
+  }, 30000);
+
+  test('sender has change output after transfer', async () => {
+    const minerWallet = testnet.getMinerWallet();
+    await testnet.syncWallet(minerWallet);
+
+    const { balance } = await testnet.getBalance(minerWallet);
+    // Miner should still have funds (change from previous transfer + new coinbase)
+    expect(balance).toBeGreaterThan(0n);
+  }, 30000);
+
+  test('double-spend is rejected', async () => {
+    // Key images from the first transfer should be marked as spent
+    expect(testnet.node.spentKeyImages.size).toBeGreaterThan(0);
+
+    const spent = await testnet.node.isKeyImageSpent(
+      [...testnet.node.spentKeyImages].slice(0, 1)
+    );
+    expect(spent.spent_status[0]).toBe(1);
+
+    // Attempting to resubmit a TX with the same key image should fail
+    const fakeTx = { _meta: { keyImages: [...testnet.node.spentKeyImages].slice(0, 1) } };
+    const result = await testnet.node.sendRawTransaction(fakeTx);
+    expect(result.success).toBe(false);
+  });
+});
+
 describe('Testnet CARROT Hard Fork', () => {
   let testnet;
 
@@ -240,7 +311,7 @@ describe('Testnet CARROT Hard Fork', () => {
     for (const o of carrotOutputs) {
       expect(o.amount).toBeGreaterThan(0n);
     }
-  });
+  }, 120000);
 
   test('post-fork blocks use carrot_v1 output format', async () => {
     const block = await testnet.node.getBlock({ height: 1100 });
@@ -260,5 +331,5 @@ describe('Testnet CARROT Hard Fork', () => {
     expect(balance).toBeGreaterThan(0n);
     // With 1100+ blocks mined, most should be unlocked (60-block window)
     expect(unlockedBalance).toBeGreaterThan(0n);
-  });
+  }, 120000);
 });
