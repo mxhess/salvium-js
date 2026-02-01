@@ -362,12 +362,6 @@ export class WalletSync {
     // Process blocks in batches using batch RPC for better performance
     const BLOCK_BATCH_SIZE = 100; // Fetch 100 blocks per RPC call
 
-    // Debug: log first syncBatch call
-    if (this._syncBatchCount === undefined) this._syncBatchCount = 0;
-    this._syncBatchCount++;
-    if (this._syncBatchCount === 1) {
-      console.log(`[DEBUG] First _syncBatch call, headers count=${headers.length}`);
-    }
 
     for (let i = 0; i < headers.length; i += BLOCK_BATCH_SIZE) {
       if (this._stopRequested) break;
@@ -378,10 +372,6 @@ export class WalletSync {
       // Batch fetch all blocks at once
       const blocksResponse = await this.daemon.getBlocksByHeight(heights);
 
-      // Debug: log batch response status
-      if (this._syncBatchCount === 1 && i === 0) {
-        console.log(`[DEBUG] Batch fetch response: success=${blocksResponse.success}, has blocks=${!!blocksResponse.result?.blocks}, blocks count=${blocksResponse.result?.blocks?.length || 0}`);
-      }
 
       if (!blocksResponse.success || !blocksResponse.result?.blocks) {
         // Fallback to individual fetches if batch fails
@@ -457,20 +447,10 @@ export class WalletSync {
     // blockData from get_blocks_by_height.bin contains block blob
     // We need to parse it or use the included transactions
 
-    // Debug: log batch processing status
-    if (this._batchDebugCount === undefined) this._batchDebugCount = 0;
-    this._batchDebugCount++;
-    if (this._batchDebugCount <= 3) {
-      console.log(`[DEBUG] _processBlockFromBatch at height ${header.height}`);
-      console.log(`[DEBUG] blockData keys: ${blockData ? Object.keys(blockData).join(', ') : 'null'}`);
-    }
 
     // If blockData has the structure we need, use it directly
     // Otherwise fall back to individual fetch
     if (!blockData || !blockData.block) {
-      if (this._batchDebugCount <= 3) {
-        console.log(`[DEBUG] Falling back to individual fetch for height ${header.height}`);
-      }
       return this._processBlock(header);
     }
 
@@ -543,9 +523,6 @@ export class WalletSync {
    * @param {Object} header - Block header
    */
   async _processBlock(header) {
-    // Debug: count blocks processed via individual fetch
-    if (this._individualBlockCount === undefined) this._individualBlockCount = 0;
-    this._individualBlockCount++;
 
     // Get full block data - includes miner_tx and protocol_tx in JSON
     const blockResponse = await this.daemon.getBlock({ height: header.height });
@@ -566,14 +543,6 @@ export class WalletSync {
       }
     }
 
-    // Debug: log first few blocks' miner_tx structure
-    if (this._individualBlockCount <= 3 && blockJson?.miner_tx) {
-      console.log(`[DEBUG] Block ${header.height} miner_tx keys: ${Object.keys(blockJson.miner_tx).join(', ')}`);
-      console.log(`[DEBUG] miner_tx.vout count: ${(blockJson.miner_tx.vout || []).length}`);
-      if (blockJson.miner_tx.vout?.[0]?.target) {
-        console.log(`[DEBUG] First vout target keys: ${Object.keys(blockJson.miner_tx.vout[0].target).join(', ')}`);
-      }
-    }
 
     // Process miner_tx (coinbase - block reward)
     if (blockJson?.miner_tx && block.miner_tx_hash) {
@@ -637,15 +606,6 @@ export class WalletSync {
   async _processEmbeddedTransaction(txJson, txHash, header, options = {}) {
     const { isMinerTx = false, isProtocolTx = false } = options;
 
-    // Debug: count embedded txs processed
-    if (this._embeddedTxCount === undefined) this._embeddedTxCount = 0;
-    this._embeddedTxCount++;
-    if (this._embeddedTxCount <= 3) {
-      console.log(`[DEBUG] Processing embedded tx at height ${header.height}, isMinerTx=${isMinerTx}, vout count=${(txJson.vout || []).length}`);
-      if (txJson.extra) {
-        console.log(`[DEBUG] extra field type: ${Array.isArray(txJson.extra) ? 'array' : typeof txJson.extra}, length=${txJson.extra.length || 0}`);
-      }
-    }
 
     // Check if we already have this transaction
     const existing = await this.storage.getTransaction(txHash);
@@ -659,11 +619,6 @@ export class WalletSync {
       const txPubKey = extractTxPubKey(tx);
       const paymentId = extractPaymentId(tx);
 
-      // Debug: log txPubKey extraction
-      if (this._embeddedTxCount <= 3) {
-        console.log(`[DEBUG] txPubKey extracted: ${txPubKey ? bytesToHex(txPubKey) : 'null'}`);
-        console.log(`[DEBUG] converted vout count: ${(tx.prefix?.vout || []).length}`);
-      }
 
       // Determine transaction type
       const txType = isMinerTx ? 'miner' : (isProtocolTx ? 'protocol' : this._getTxType(tx));
@@ -816,10 +771,17 @@ export class WalletSync {
           viewTag
         };
       } else if (target?.key) {
+        // target.key can be a string (plain key) or object {key, asset_type, unlock_time}
+        // The latter appears in genesis/pre-tagged_key blocks
+        const keyVal = typeof target.key === 'object' ? target.key.key : target.key;
+        const assetType = typeof target.key === 'object' ? (target.key.asset_type || 'SAL') : 'SAL';
+        const unlockTime = typeof target.key === 'object' ? (target.key.unlock_time || 0) : 0;
         return {
           amount: this._safeBigInt(out.amount),
           type: 0x02, // TXOUT_TYPE.KEY
-          key: hexToBytes(target.key)
+          key: hexToBytes(keyVal),
+          assetType,
+          unlockTime
         };
       }
       return { amount: this._safeBigInt(out.amount), type: 0 };
@@ -880,12 +842,6 @@ export class WalletSync {
   _convertExtraJson(extraArray) {
     // Extra in JSON is just an array of bytes
     if (!Array.isArray(extraArray) || extraArray.length === 0) {
-      // Debug: log if extra is empty or wrong format
-      if (this._extraDebugCount === undefined) this._extraDebugCount = 0;
-      this._extraDebugCount++;
-      if (this._extraDebugCount <= 3) {
-        console.log(`[DEBUG] _convertExtraJson: extraArray is ${Array.isArray(extraArray) ? 'array of length ' + extraArray.length : typeof extraArray}`);
-      }
       return [];
     }
 
@@ -893,12 +849,6 @@ export class WalletSync {
     const extraBytes = new Uint8Array(extraArray);
     const parsed = [];
 
-    // Debug: log first few bytes
-    if (this._extraDebugCount === undefined) this._extraDebugCount = 0;
-    this._extraDebugCount++;
-    if (this._extraDebugCount <= 3) {
-      console.log(`[DEBUG] _convertExtraJson: extraBytes length=${extraBytes.length}, first bytes: ${Array.from(extraBytes.slice(0, 5)).map(b => b.toString(16)).join(' ')}`);
-    }
     let offset = 0;
 
     while (offset < extraBytes.length) {
@@ -971,12 +921,6 @@ export class WalletSync {
     const txHash = txData.tx_hash;
     const txBlob = txData.as_hex;
 
-    // Debug: count regular txs processed
-    if (this._regularTxCount === undefined) this._regularTxCount = 0;
-    this._regularTxCount++;
-    if (this._regularTxCount <= 3) {
-      console.log(`[DEBUG] _processTransaction at height ${header.height}, tx ${txHash.slice(0, 16)}...`);
-    }
 
     // Check if we already have this transaction
     const existing = await this.storage.getTransaction(txHash);
@@ -990,10 +934,6 @@ export class WalletSync {
       const txPubKey = extractTxPubKey(tx);
       const paymentId = extractPaymentId(tx);
 
-      // Debug: log tx structure
-      if (this._regularTxCount <= 3) {
-        console.log(`[DEBUG] Regular tx: txPubKey=${txPubKey ? bytesToHex(txPubKey).slice(0, 16) + '...' : 'null'}, vout count=${(tx.prefix?.vout || []).length}`);
-      }
 
       // Determine transaction type (Salvium-specific)
       // For miner_tx and protocol_tx, use the type from the prefix
@@ -1095,24 +1035,6 @@ export class WalletSync {
     const ownedOutputs = [];
     const outputs = tx.prefix?.vout || tx.outputs || [];
 
-    // Debug: log first 3 calls unconditionally
-    if (this._scanOutputsCount === undefined) this._scanOutputsCount = 0;
-    this._scanOutputsCount++;
-    if (this._scanOutputsCount <= 3) {
-      console.log(`\n=== _scanOutputs call #${this._scanOutputsCount} at height ${header.height} ===`);
-      console.log(`txHash: ${txHash}`);
-      console.log(`txPubKey: ${txPubKey ? bytesToHex(txPubKey) : 'NULL'}`);
-      console.log(`outputs count: ${outputs.length}`);
-      console.log(`txType: ${txType}`);
-      if (outputs.length > 0) {
-        const firstOutput = outputs[0];
-        console.log(`first output type: ${firstOutput.type}`);
-        console.log(`first output keys: ${Object.keys(firstOutput).join(', ')}`);
-        const firstKey = this._extractOutputPubKey(firstOutput);
-        console.log(`first output pubkey: ${firstKey ? bytesToHex(firstKey).slice(0, 32) + '...' : 'NULL'}`);
-      }
-      console.log(`===\n`);
-    }
 
     for (let i = 0; i < outputs.length; i++) {
       const output = outputs[i];
@@ -1220,13 +1142,6 @@ export class WalletSync {
         ? hexToBytes(firstKi)
         : firstKi;
       inputContext = makeInputContext(firstKeyImage);
-      // Debug: show first key image
-      if (header.height >= 405588 && header.height <= 405590 && this._inputContextDebug === undefined) {
-        this._inputContextDebug = true;
-        console.log(`[INPUT CONTEXT DEBUG] height=${header.height} txHash=${txHash.slice(0,16)}...`);
-        console.log(`  firstKeyImage: ${bytesToHex(firstKeyImage)}`);
-        console.log(`  inputContext: ${bytesToHex(inputContext)}`);
-      }
     } else {
       // Coinbase transaction: input_context = 'C' || block_height
       inputContext = makeInputContextCoinbase(header.height);
@@ -1269,15 +1184,6 @@ export class WalletSync {
       encryptedAmount: tx.rct?.ecdhInfo?.[outputIndex]?.amount
     };
 
-    // Debug CARROT scanning inputs
-    if (header.height >= 405585 && header.height <= 405595) {
-      console.log(`[DEBUG CARROT SCAN] height=${header.height} outputIndex=${outputIndex}`);
-      console.log(`  key: ${outputForScan.key ? bytesToHex(outputForScan.key).slice(0,16) + '...' : 'NULL'}`);
-      console.log(`  viewTag: ${outputForScan.viewTag}`);
-      console.log(`  enoteEphemeralPubkey: ${outputForScan.enoteEphemeralPubkey ? (typeof outputForScan.enoteEphemeralPubkey === 'string' ? outputForScan.enoteEphemeralPubkey.slice(0,16) : bytesToHex(outputForScan.enoteEphemeralPubkey).slice(0,16)) + '...' : 'NULL'}`);
-      console.log(`  amountCommitment: ${amountCommitment ? bytesToHex(amountCommitment).slice(0,16) + '...' : 'NULL'}`);
-      console.log(`  carrotKeys: viewIncomingKey=${this.carrotKeys?.viewIncomingKey ? 'SET' : 'NULL'}, accountSpendPubkey=${this.carrotKeys?.accountSpendPubkey ? 'SET' : 'NULL'}`);
-    }
 
     // Scan with CARROT algorithm
     let result;
@@ -1370,33 +1276,21 @@ export class WalletSync {
    * @private
    */
   async _scanCNOutput(output, outputIndex, tx, txHash, txPubKey, header) {
-    // Debug: count CN scan attempts
-    if (this._cnScanCount === undefined) this._cnScanCount = 0;
-    this._cnScanCount++;
 
     const outputPubKey = this._extractOutputPubKey(output);
     if (!outputPubKey) {
-      if (this._cnScanCount <= 3) {
-        console.log(`[DEBUG] _scanCNOutput: no outputPubKey for output ${outputIndex}`);
-      }
       return null;
     }
 
     // Compute key derivation: D = 8 * viewSecretKey * txPubKey
     const derivation = generateKeyDerivation(txPubKey, this.keys.viewSecretKey);
     if (!derivation) {
-      if (this._cnScanCount <= 3) {
-        console.log(`[DEBUG] _scanCNOutput: derivation failed`);
-      }
       return null;
     }
 
     // Check view tag FIRST (if available) for fast rejection
     if (output.viewTag !== undefined) {
       const expectedViewTag = deriveViewTag(derivation, outputIndex);
-      if (this._cnScanCount <= 3) {
-        console.log(`[DEBUG] _scanCNOutput: viewTag check - output.viewTag=${output.viewTag}, expected=${expectedViewTag}`);
-      }
       if (output.viewTag !== expectedViewTag) {
         return null; // Not our output - skip expensive operations
       }
@@ -1407,9 +1301,6 @@ export class WalletSync {
     // This gives us the spend pubkey that was used to create this output
     const derivedSpendPubKey = deriveSubaddressPublicKey(outputPubKey, derivation, outputIndex);
     if (!derivedSpendPubKey) {
-      if (this._cnScanCount <= 3) {
-        console.log(`[DEBUG] _scanCNOutput: deriveSubaddressPublicKey failed`);
-      }
       return null;
     }
 
@@ -1421,12 +1312,6 @@ export class WalletSync {
       subaddressIndex = this.subaddresses.get(derivedSpendPubKeyHex);
     }
 
-    // Debug: log first few lookups
-    if (this._cnScanCount <= 3) {
-      console.log(`[DEBUG] _scanCNOutput: derived spend key=${derivedSpendPubKeyHex.slice(0, 16)}...`);
-      console.log(`[DEBUG] _scanCNOutput: subaddress map size=${this.subaddresses?.size || 0}`);
-      console.log(`[DEBUG] _scanCNOutput: found in map=${!!subaddressIndex}`);
-    }
 
     if (!subaddressIndex) {
       return null; // Not our output
@@ -1500,9 +1385,6 @@ export class WalletSync {
     const spentOutputs = [];
     const inputs = tx.prefix?.vin || tx.inputs || [];
 
-    // Debug: log first few checks
-    if (this._spentCheckCount === undefined) this._spentCheckCount = 0;
-    this._spentCheckCount++;
 
     for (const input of inputs) {
       // Parsed transactions use input.keyImage directly
@@ -1517,13 +1399,8 @@ export class WalletSync {
       // Check if this key image belongs to one of our outputs
       const output = await this.storage.getOutput(keyImage);
 
-      // Debug: log when we find a potential match or at specific heights
-      if (output || (header.height >= 270510 && header.height <= 270530)) {
-        console.log(`[DEBUG] _checkSpentOutputs height=${header.height} keyImage=${keyImage.slice(0,16)}... found=${!!output}`);
-      }
 
       if (output && !output.isSpent) {
-        console.log(`[SPENT] Output spent at height ${header.height}: keyImage=${keyImage.slice(0,16)}... amount=${output.amount}`);
         await this.storage.markOutputSpent(keyImage, txHash, header.height);
         spentOutputs.push(output);
       }
