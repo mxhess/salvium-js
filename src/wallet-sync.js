@@ -13,7 +13,7 @@
 import { WalletOutput, WalletTransaction } from './wallet-store.js';
 import { cnSubaddressSecretKey, carrotIndexExtensionGenerator, carrotSubaddressScalar } from './subaddress.js';
 import { scanCarrotOutput, makeInputContext, makeInputContextCoinbase, generateCarrotKeyImage } from './carrot-scanning.js';
-import { parseTransaction, extractTxPubKey, extractPaymentId } from './transaction.js';
+import { parseTransaction, parseBlock, extractTxPubKey, extractPaymentId } from './transaction.js';
 import { bytesToHex, hexToBytes } from './address.js';
 import { TX_TYPE } from './wallet.js';
 import {
@@ -21,6 +21,7 @@ import {
   generateKeyImage, commit as pedersonCommit,
   deriveViewTag, computeSharedSecret, ecdhDecodeFull,
   deriveSubaddressPublicKey, scalarAdd,
+  cnFastHash,
 } from './crypto/index.js';
 
 // ============================================================================
@@ -359,45 +360,12 @@ export class WalletSync {
 
     const headers = headersResponse.result.headers || [];
 
-    // Process blocks in batches using batch RPC for better performance
-    const BLOCK_BATCH_SIZE = 100; // Fetch 100 blocks per RPC call
-
-
-    for (let i = 0; i < headers.length; i += BLOCK_BATCH_SIZE) {
+    for (const header of headers) {
       if (this._stopRequested) break;
-
-      const batch = headers.slice(i, i + BLOCK_BATCH_SIZE);
-      const heights = batch.map(h => h.height);
-
-      // Batch fetch all blocks at once
-      const blocksResponse = await this.daemon.getBlocksByHeight(heights);
-
-
-      if (!blocksResponse.success || !blocksResponse.result?.blocks) {
-        // Fallback to individual fetches if batch fails
-        for (const header of batch) {
-          if (this._stopRequested) break;
-          await this._processBlock(header);
-          await this.storage.putBlockHash(header.height, header.hash);
-          this.currentHeight = header.height + 1;
-          this._emit('syncProgress', this.getProgress());
-        }
-        continue;
-      }
-
-      // Process each block from batch response
-      const blocks = blocksResponse.result.blocks;
-      for (let j = 0; j < blocks.length; j++) {
-        if (this._stopRequested) break;
-
-        const header = batch[j];
-        const blockData = blocks[j];
-
-        await this._processBlockFromBatch(header, blockData);
-        await this.storage.putBlockHash(header.height, header.hash);
-        this.currentHeight = header.height + 1;
-        this._emit('syncProgress', this.getProgress());
-      }
+      await this._processBlock(header);
+      await this.storage.putBlockHash(header.height, header.hash);
+      this.currentHeight = header.height + 1;
+      this._emit('syncProgress', this.getProgress());
     }
 
     // Save sync height
@@ -437,84 +405,6 @@ export class WalletSync {
       batchSize: this.batchSize,
       blocksPerSec: this.batchSize / (elapsed / 1000)
     });
-  }
-
-  /**
-   * Process a block from batch response
-   * @private
-   */
-  async _processBlockFromBatch(header, blockData) {
-    // blockData from get_blocks_by_height.bin contains block blob
-    // We need to parse it or use the included transactions
-
-
-    // If blockData has the structure we need, use it directly
-    // Otherwise fall back to individual fetch
-    if (!blockData || !blockData.block) {
-      return this._processBlock(header);
-    }
-
-    try {
-      // Parse block blob to get miner_tx and protocol_tx
-      // The block field contains the hex-encoded block
-      const blockBlob = blockData.block;
-
-      // For now, decode the block JSON if available, otherwise parse binary
-      // Most daemon responses include txs array with the transactions
-      const txs = blockData.txs || [];
-
-      // Process miner_tx from block header data if available
-      if (blockData.miner_tx_hash) {
-        // Find miner_tx in txs array or parse from block
-        const minerTx = txs.find(tx => tx.tx_hash === blockData.miner_tx_hash);
-        if (minerTx && minerTx.as_json) {
-          await this._processEmbeddedTransaction(
-            JSON.parse(minerTx.as_json),
-            blockData.miner_tx_hash,
-            header,
-            { isMinerTx: true, isProtocolTx: false }
-          );
-        }
-      }
-
-      // Process protocol_tx if available
-      if (blockData.protocol_tx_hash) {
-        const protocolTx = txs.find(tx => tx.tx_hash === blockData.protocol_tx_hash);
-        if (protocolTx && protocolTx.as_json) {
-          await this._processEmbeddedTransaction(
-            JSON.parse(protocolTx.as_json),
-            blockData.protocol_tx_hash,
-            header,
-            { isMinerTx: false, isProtocolTx: true }
-          );
-        }
-      }
-
-      // Process regular transactions
-      for (const tx of txs) {
-        if (tx.tx_hash === blockData.miner_tx_hash || tx.tx_hash === blockData.protocol_tx_hash) {
-          continue; // Already processed
-        }
-        if (tx.as_hex) {
-          await this._processTransaction(tx, header, { isMinerTx: false, isProtocolTx: false });
-        }
-      }
-
-      // Emit new block event
-      this._emit('newBlock', {
-        height: header.height,
-        hash: header.hash,
-        timestamp: header.timestamp,
-        txCount: txs.length,
-        hasMinerTx: !!blockData.miner_tx_hash,
-        hasProtocolTx: !!blockData.protocol_tx_hash
-      });
-
-    } catch (error) {
-      // Fallback to individual block processing
-      console.error(`Batch processing failed for block ${header.height}, falling back:`, error.message);
-      await this._processBlock(header);
-    }
   }
 
   /**

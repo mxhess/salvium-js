@@ -14,6 +14,7 @@
  */
 
 import { RPCClient, RPC_STATUS } from './client.js';
+import { serialize as psSerialize, deserialize as psDeserialize } from './portable-storage.js';
 
 /**
  * @typedef {import('./client.js').RPCClientOptions} RPCClientOptions
@@ -278,10 +279,37 @@ export class DaemonRPC extends RPCClient {
   /**
    * Get blocks by height (efficient binary format)
    * @param {number[]} heights - Array of block heights
-   * @returns {Promise<RPCResponse>} Blocks data
+   * @returns {Promise<RPCResponse>} Blocks data with block and tx blobs
    */
   async getBlocksByHeight(heights) {
-    return this.post('/get_blocks_by_height.bin', { heights });
+    const body = psSerialize({
+      heights: { _type: 'uint64_array', values: heights }
+    });
+    const resp = await this.postBinary('/get_blocks_by_height.bin', body);
+    if (!resp.success) return resp;
+
+    try {
+      const parsed = psDeserialize(resp.result);
+      // parsed.blocks is array of { block: Uint8Array, txs: Uint8Array[] }
+      // parsed.status is Uint8Array
+      const status = parsed.status
+        ? new TextDecoder().decode(parsed.status)
+        : 'OK';
+
+      if (status !== 'OK') {
+        return { success: false, error: { code: -1, message: `Status: ${status}` } };
+      }
+
+      return {
+        success: true,
+        result: {
+          blocks: parsed.blocks || [],
+          status
+        }
+      };
+    } catch (e) {
+      return { success: false, error: { code: -1, message: e.message } };
+    }
   }
 
   /**

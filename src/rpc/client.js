@@ -314,6 +314,75 @@ export class RPCClient {
   }
 
   /**
+   * POST binary data (portable storage format) and parse binary response
+   * @param {string} endpoint - API endpoint path
+   * @param {Uint8Array} body - Binary request body
+   * @returns {Promise<RPCResponse>}
+   */
+  async postBinary(endpoint, body) {
+    let lastError = null;
+    const attempts = this.retries + 1;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const url = endpoint.startsWith('/')
+          ? `${this.url}${endpoint}`
+          : `${this.url}/${endpoint}`;
+
+        const response = await this._fetchWithTimeout(url, {
+          method: 'POST',
+          headers: {
+            ...this._buildHeaders(),
+            'Content-Type': 'application/octet-stream'
+          },
+          body
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            return {
+              success: false,
+              error: {
+                code: RPC_ERROR_CODES.AUTHENTICATION_ERROR,
+                message: 'Authentication failed'
+              }
+            };
+          }
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        return {
+          success: true,
+          result: new Uint8Array(arrayBuffer)
+        };
+
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          lastError = {
+            code: RPC_ERROR_CODES.TIMEOUT_ERROR,
+            message: `Request timed out after ${this.timeout}ms`
+          };
+        } else {
+          lastError = {
+            code: RPC_ERROR_CODES.NETWORK_ERROR,
+            message: error.message || 'Network error'
+          };
+        }
+
+        if (attempt < attempts) {
+          await this._sleep(this.retryDelay);
+        }
+      }
+    }
+
+    return {
+      success: false,
+      error: lastError
+    };
+  }
+
+  /**
    * Make a raw HTTP GET request
    * @param {string} endpoint - API endpoint path
    * @param {Object} [params={}] - Query parameters
