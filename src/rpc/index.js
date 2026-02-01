@@ -65,6 +65,12 @@ export {
   STAGENET_URL as WALLET_STAGENET_URL
 } from './wallet.js';
 
+// Connection manager
+export {
+  ConnectionManager,
+  SEED_NODES
+} from './connection-manager.js';
+
 // Default export with all components
 import { RPCClient, createClient, RPC_ERROR_CODES, RPC_STATUS } from './client.js';
 import {
@@ -74,6 +80,7 @@ import {
   RESTRICTED_MAINNET_URL as DAEMON_RESTRICTED_MAINNET, RESTRICTED_TESTNET_URL as DAEMON_RESTRICTED_TESTNET, RESTRICTED_STAGENET_URL as DAEMON_RESTRICTED_STAGENET
 } from './daemon.js';
 import { WalletRPC, createWalletRPC, PRIORITY, TRANSFER_TYPE, MAINNET_URL as WALLET_MAINNET, TESTNET_URL as WALLET_TESTNET, STAGENET_URL as WALLET_STAGENET } from './wallet.js';
+import { ConnectionManager, SEED_NODES } from './connection-manager.js';
 
 export default {
   // Base client
@@ -81,6 +88,10 @@ export default {
   createClient,
   RPC_ERROR_CODES,
   RPC_STATUS,
+
+  // Connection manager
+  ConnectionManager,
+  SEED_NODES,
 
   // Daemon RPC
   DaemonRPC,

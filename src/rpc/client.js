@@ -4,7 +4,13 @@
  * Provides HTTP client infrastructure for Salvium daemon and wallet RPC.
  * Supports JSON-RPC 2.0 protocol with authentication, retries, and error handling.
  * Works in both browser and Node.js environments.
+ *
+ * Supports multiple server URLs with latency-based selection via ConnectionManager.
+ * Single URL = direct connection (no overhead).
+ * Multiple URLs = race on connect, pick fastest, failover on error.
  */
+
+import { ConnectionManager, SEED_NODES } from './connection-manager.js';
 
 /**
  * @typedef {Object} RPCClientOptions
@@ -67,11 +73,28 @@ export class RPCClient {
    * @param {RPCClientOptions} options - Client configuration
    */
   constructor(options = {}) {
-    if (!options.url) {
-      throw new Error('RPC client requires a URL');
+    // Resolve URLs: explicit urls array, network seed nodes, or single url
+    let urls = options.urls || null;
+    if (!urls && options.network && SEED_NODES[options.network]) {
+      urls = SEED_NODES[options.network];
     }
 
-    this.url = options.url.replace(/\/+$/, ''); // Remove trailing slashes
+    if (urls && urls.length > 0) {
+      this.url = urls[0].replace(/\/+$/, '');
+      this._connectionManager = new ConnectionManager({
+        urls: urls.map(u => u.replace(/\/+$/, '')),
+        raceTimeout: options.raceTimeout || 5000,
+        degradationFactor: options.degradationFactor || 2,
+        raceInterval: options.raceInterval || 0,
+        onSwitch: options.onSwitch || null,
+      });
+    } else if (options.url) {
+      this.url = options.url.replace(/\/+$/, '');
+      this._connectionManager = null;
+    } else {
+      throw new Error('RPC client requires a url, urls array, or network name');
+    }
+
     this.username = options.username || null;
     this.password = options.password || null;
     this.timeout = options.timeout || 30000;
@@ -79,6 +102,31 @@ export class RPCClient {
     this.retryDelay = options.retryDelay || 1000;
     this.headers = options.headers || {};
     this._requestId = 0;
+  }
+
+  /**
+   * Get the currently active URL (may change with ConnectionManager)
+   * @returns {string}
+   */
+  getActiveUrl() {
+    if (this._connectionManager) {
+      return this._connectionManager.activeUrl;
+    }
+    return this.url;
+  }
+
+  /**
+   * Race all configured servers and pick the fastest.
+   * No-op if only one server is configured.
+   * @returns {Promise<string>} The active URL after racing
+   */
+  async race() {
+    if (this._connectionManager) {
+      const url = await this._connectionManager.race();
+      this.url = url;
+      return url;
+    }
+    return this.url;
   }
 
   /**
@@ -148,6 +196,47 @@ export class RPCClient {
    * @param {Object} [params={}] - Method parameters
    * @returns {Promise<RPCResponse>}
    */
+  /**
+   * Get the current URL, ensuring connection manager has raced if needed.
+   * @returns {Promise<string>}
+   * @private
+   */
+  async _resolveUrl() {
+    if (this._connectionManager) {
+      await this._connectionManager.ensureConnected();
+      this.url = this._connectionManager.activeUrl;
+    }
+    return this.url;
+  }
+
+  /**
+   * Record latency and handle failover via connection manager.
+   * @param {number} latencyMs - Response latency
+   * @private
+   */
+  _recordLatency(latencyMs) {
+    if (this._connectionManager) {
+      this._connectionManager.recordLatency(latencyMs);
+      this.url = this._connectionManager.activeUrl;
+    }
+  }
+
+  /**
+   * Handle network failure — failover to next server if available.
+   * @returns {Promise<boolean>} true if a new server is available to retry
+   * @private
+   */
+  async _handleNetworkFailure() {
+    if (this._connectionManager && this._connectionManager.isMultiServer) {
+      const newUrl = await this._connectionManager.handleFailure();
+      if (newUrl) {
+        this.url = newUrl;
+        return true;
+      }
+    }
+    return false;
+  }
+
   async call(method, params = {}) {
     const payload = {
       jsonrpc: '2.0',
@@ -156,16 +245,21 @@ export class RPCClient {
       params
     };
 
+    await this._resolveUrl();
+
     let lastError = null;
     const attempts = this.retries + 1;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const start = Date.now();
       try {
         const response = await this._fetchWithTimeout(`${this.url}/json_rpc`, {
           method: 'POST',
           headers: this._buildHeaders(),
           body: JSON.stringify(payload)
         });
+
+        this._recordLatency(Date.now() - start);
 
         if (!response.ok) {
           if (response.status === 401) {
@@ -225,6 +319,11 @@ export class RPCClient {
           };
         }
 
+        // Try failover to another server before exhausting retries
+        if (await this._handleNetworkFailure()) {
+          continue; // Retry on the new server
+        }
+
         if (attempt < attempts) {
           await this._sleep(this.retryDelay);
         }
@@ -244,10 +343,13 @@ export class RPCClient {
    * @returns {Promise<RPCResponse>}
    */
   async post(endpoint, data = {}) {
+    await this._resolveUrl();
+
     let lastError = null;
     const attempts = this.retries + 1;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const start = Date.now();
       try {
         const url = endpoint.startsWith('/')
           ? `${this.url}${endpoint}`
@@ -258,6 +360,8 @@ export class RPCClient {
           headers: this._buildHeaders(),
           body: JSON.stringify(data)
         });
+
+        this._recordLatency(Date.now() - start);
 
         if (!response.ok) {
           if (response.status === 401) {
@@ -301,6 +405,10 @@ export class RPCClient {
           };
         }
 
+        if (await this._handleNetworkFailure()) {
+          continue;
+        }
+
         if (attempt < attempts) {
           await this._sleep(this.retryDelay);
         }
@@ -320,10 +428,13 @@ export class RPCClient {
    * @returns {Promise<RPCResponse>}
    */
   async postBinary(endpoint, body) {
+    await this._resolveUrl();
+
     let lastError = null;
     const attempts = this.retries + 1;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const start = Date.now();
       try {
         const url = endpoint.startsWith('/')
           ? `${this.url}${endpoint}`
@@ -337,6 +448,8 @@ export class RPCClient {
           },
           body
         });
+
+        this._recordLatency(Date.now() - start);
 
         if (!response.ok) {
           if (response.status === 401) {
@@ -370,6 +483,10 @@ export class RPCClient {
           };
         }
 
+        if (await this._handleNetworkFailure()) {
+          continue;
+        }
+
         if (attempt < attempts) {
           await this._sleep(this.retryDelay);
         }
@@ -389,10 +506,13 @@ export class RPCClient {
    * @returns {Promise<RPCResponse>}
    */
   async get(endpoint, params = {}) {
+    await this._resolveUrl();
+
     let lastError = null;
     const attempts = this.retries + 1;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const start = Date.now();
       try {
         let url = endpoint.startsWith('/')
           ? `${this.url}${endpoint}`
@@ -414,6 +534,8 @@ export class RPCClient {
           method: 'GET',
           headers: this._buildHeaders()
         });
+
+        this._recordLatency(Date.now() - start);
 
         if (!response.ok) {
           if (response.status === 401) {
@@ -446,6 +568,10 @@ export class RPCClient {
             code: RPC_ERROR_CODES.NETWORK_ERROR,
             message: error.message || 'Network error'
           };
+        }
+
+        if (await this._handleNetworkFailure()) {
+          continue;
         }
 
         if (attempt < attempts) {
