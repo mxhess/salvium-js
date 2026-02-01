@@ -2,33 +2,57 @@
  * WASM Crypto Backend
  *
  * Loads Rust-compiled WASM module and wraps it behind the unified backend interface.
- * Falls back gracefully if WASM cannot be loaded.
+ * Supports both Node/Bun (fs.readFile) and browser (fetch) environments.
  *
  * @module crypto/backend-wasm
  */
 
-import { readFile } from 'fs/promises';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 let wasmExports = null;
 
 /**
- * Load and instantiate the WASM module from disk
+ * Detect if running in a browser environment
+ */
+function isBrowser() {
+  return typeof window !== 'undefined' || (typeof globalThis !== 'undefined' && typeof globalThis.document !== 'undefined');
+}
+
+/**
+ * Load WASM bytes from disk (Node/Bun)
+ */
+async function loadWasmNode() {
+  const { readFile } = await import('fs/promises');
+  const { fileURLToPath } = await import('url');
+  const { dirname, join } = await import('path');
+
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const wasmPath = join(__dirname, 'wasm', 'salvium_crypto_bg.wasm');
+  return readFile(wasmPath);
+}
+
+/**
+ * Load WASM bytes via fetch (browser)
+ */
+async function loadWasmBrowser() {
+  // Resolve relative to this module's URL
+  const wasmUrl = new URL('./wasm/salvium_crypto_bg.wasm', import.meta.url);
+  const response = await fetch(wasmUrl);
+  if (!response.ok) throw new Error(`Failed to fetch WASM: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * Load and instantiate the WASM module
  */
 async function loadWasm() {
   if (wasmExports) return wasmExports;
 
-  const wasmPath = join(__dirname, 'wasm', 'salvium_crypto_bg.wasm');
-  const wasmBytes = await readFile(wasmPath);
+  const wasmBytes = isBrowser() ? await loadWasmBrowser() : await loadWasmNode();
 
   // Import the JS glue to get the import object and init function
   const glue = await import('./wasm/salvium_crypto.js');
 
-  // Use initSync with the raw WASM bytes (works in Bun/Node, no fetch needed)
+  // Use initSync with the raw WASM bytes
   glue.initSync({ module: wasmBytes });
   wasmExports = glue;
   return wasmExports;
