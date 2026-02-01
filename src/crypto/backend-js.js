@@ -17,6 +17,9 @@ import {
   scalarMultBase, scalarMultPoint, pointAddCompressed,
   pointSubCompressed, pointNegate, doubleScalarMultBase
 } from '../ed25519.js';
+import { hashToPoint, generateKeyImage } from '../keyimage.js';
+import { generateKeyDerivation, derivePublicKey, deriveSecretKey } from '../scanning.js';
+import { commit, zeroCommit, genCommitmentMask } from '../transaction/serialization.js';
 
 export class JsCryptoBackend {
   constructor() {
@@ -60,4 +63,16 @@ export class JsCryptoBackend {
     const bG = scalarMultBase(b);
     return pointAddCompressed(aP, bG);
   }
+
+  // Hash-to-point & key derivation
+  hashToPoint(data) { return hashToPoint(data); }
+  generateKeyImage(pubKey, secKey) { return generateKeyImage(pubKey, secKey); }
+  generateKeyDerivation(pubKey, secKey) { return generateKeyDerivation(pubKey, secKey); }
+  derivePublicKey(derivation, outputIndex, basePub) { return derivePublicKey(derivation, outputIndex, basePub); }
+  deriveSecretKey(derivation, outputIndex, baseSec) { return deriveSecretKey(derivation, outputIndex, baseSec); }
+
+  // Pedersen commitments
+  commit(amount, mask) { return commit(amount, mask); }
+  zeroCommit(amount) { return zeroCommit(amount); }
+  genCommitmentMask(sharedSecret) { return genCommitmentMask(sharedSecret); }
 }

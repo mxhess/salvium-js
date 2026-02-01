@@ -15,6 +15,9 @@ import {
   scReduce32, scReduce64, scInvert, scCheck, scIsZero,
   scalarMultBase, scalarMultPoint, pointAddCompressed,
   pointSubCompressed, pointNegate, doubleScalarMultBase,
+  hashToPoint, generateKeyImage, generateKeyDerivation,
+  derivePublicKey, deriveSecretKey,
+  commit, zeroCommit, genCommitmentMask,
 } from '../src/crypto/index.js';
 import { JsCryptoBackend } from '../src/crypto/backend-js.js';
 import { hexToBytes, bytesToHex } from '../src/index.js';
@@ -343,6 +346,133 @@ await asyncTest('doubleScalarMultBase equivalence', async () => {
   assertEqual(jsResult, wasmResult, 'doubleScalarMultBase JS vs WASM');
 });
 
+// ─── Hash-to-point & key derivation equivalence ─────────────────────────────
+
+console.log('\n=== Hash-to-Point & Key Derivation Equivalence ===\n');
+
+// Generate a test key pair
+const testSecKey = new Uint8Array(32);
+testSecKey.set([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+testSecKey[31] &= 0x0f;
+const testPubKey = getCryptoBackend().scalarMultBase(testSecKey);
+
+await asyncTest('hashToPoint equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const jsResult = js.hashToPoint(testPubKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().hashToPoint(testPubKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'hashToPoint JS vs WASM');
+});
+
+await asyncTest('hashToPoint equivalence (random key)', async () => {
+  const randomKey = getCryptoBackend().scalarMultBase(scalarA);
+  const js = new JsCryptoBackend();
+  const jsResult = js.hashToPoint(randomKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().hashToPoint(randomKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'hashToPoint random JS vs WASM');
+});
+
+await asyncTest('generateKeyImage equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const jsResult = js.generateKeyImage(testPubKey, testSecKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().generateKeyImage(testPubKey, testSecKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'generateKeyImage JS vs WASM');
+});
+
+await asyncTest('generateKeyDerivation equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const jsResult = js.generateKeyDerivation(testPubKey, testSecKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().generateKeyDerivation(testPubKey, testSecKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'generateKeyDerivation JS vs WASM');
+});
+
+await asyncTest('derivePublicKey equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const derivation = js.generateKeyDerivation(testPubKey, testSecKey);
+  const jsResult = js.derivePublicKey(derivation, 0, testPubKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().derivePublicKey(derivation, 0, testPubKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'derivePublicKey JS vs WASM');
+});
+
+await asyncTest('deriveSecretKey equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const derivation = js.generateKeyDerivation(testPubKey, testSecKey);
+  const jsResult = js.deriveSecretKey(derivation, 0, testSecKey);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().deriveSecretKey(derivation, 0, testSecKey);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'deriveSecretKey JS vs WASM');
+});
+
+await asyncTest('derivePublicKey matches scalarMultBase(deriveSecretKey)', async () => {
+  const js = new JsCryptoBackend();
+  const derivation = js.generateKeyDerivation(testPubKey, testSecKey);
+  const derivedSec = js.deriveSecretKey(derivation, 0, testSecKey);
+  const derivedPubFromSec = js.scalarMultBase(derivedSec);
+  const derivedPubDirect = js.derivePublicKey(derivation, 0, testPubKey);
+  assertEqual(derivedPubFromSec, derivedPubDirect, 'derivePublicKey consistency');
+});
+
+// ─── Pedersen commitment equivalence ─────────────────────────────────────────
+
+console.log('\n=== Pedersen Commitment Equivalence ===\n');
+
+const H_HEX = '8b655970153799af2aeadc9ff1add0ea6c7251d54154cfa92c173a0dd39c1f94';
+
+await asyncTest('zeroCommit(1) = H', async () => {
+  const js = new JsCryptoBackend();
+  const result = js.zeroCommit(1n);
+  assertEqual(result, hexToBytes(H_HEX), 'zeroCommit(1) should be H');
+});
+
+await asyncTest('commit equivalence (random)', async () => {
+  const js = new JsCryptoBackend();
+  const jsResult = js.commit(12345n, scalarA);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().commit(12345n, scalarA);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'commit JS vs WASM');
+});
+
+await asyncTest('zeroCommit equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const jsResult = js.zeroCommit(99999n);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().zeroCommit(99999n);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'zeroCommit JS vs WASM');
+});
+
+await asyncTest('genCommitmentMask equivalence', async () => {
+  const js = new JsCryptoBackend();
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const jsResult = js.genCommitmentMask(secret);
+  await setCryptoBackend('wasm');
+  const wasmResult = getCryptoBackend().genCommitmentMask(secret);
+  await setCryptoBackend('js');
+  assertEqual(jsResult, wasmResult, 'genCommitmentMask JS vs WASM');
+});
+
+await asyncTest('commit homomorphic: commit(a,m) - zeroCommit(a) = m*G', async () => {
+  const js = new JsCryptoBackend();
+  const amount = 42n;
+  const mask = scalarA;
+  const c = js.commit(amount, mask);
+  const z = js.zeroCommit(amount);
+  const diff = js.pointSubCompressed(c, z);
+  const mG = js.scalarMultBase(mask);
+  assertEqual(diff, mG, 'homomorphic property');
+});
+
 // ─── Benchmark ──────────────────────────────────────────────────────────────
 
 console.log('\n=== Benchmark (10,000 iterations) ===\n');
@@ -393,6 +523,9 @@ const benchOps = [
   ['scalarMultBase', BENCH_PT, () => scalarMultBase(benchScalar)],
   ['scalarMultPoint', BENCH_PT, () => scalarMultPoint(benchScalar, benchPoint)],
   ['pointAddCompressed', BENCH_PT, () => pointAddCompressed(benchPoint, benchPoint)],
+  ['hashToPoint', BENCH_PT, () => hashToPoint(benchPoint)],
+  ['generateKeyImage', BENCH_PT, () => generateKeyImage(benchPoint, benchScalar)],
+  ['generateKeyDerivation', BENCH_PT, () => generateKeyDerivation(benchPoint, benchScalar)],
 ];
 
 for (const [name, iters, fn] of benchOps) {

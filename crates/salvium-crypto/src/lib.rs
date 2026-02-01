@@ -5,6 +5,8 @@ use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::traits::VartimeMultiscalarMul;
 
+mod elligator2;
+
 /// Keccak-256 hash (CryptoNote variant with 0x01 padding, NOT SHA3)
 /// Matches Salvium C++ cn_fast_hash / keccak()
 #[wasm_bindgen]
@@ -167,4 +169,140 @@ pub fn double_scalar_mult_base(a: &[u8], p: &[u8], b: &[u8]) -> Vec<u8> {
         &[sa, sb],
         &[pp, curve25519_dalek::constants::ED25519_BASEPOINT_POINT],
     ).compress().to_bytes().to_vec()
+}
+
+// ─── Phase 3: Hash-to-Point & Key Derivation ────────────────────────────────
+
+fn keccak256_internal(data: &[u8]) -> [u8; 32] {
+    let mut keccak = Keccak::v256();
+    let mut output = [0u8; 32];
+    keccak.update(data);
+    keccak.finalize(&mut output);
+    output
+}
+
+fn encode_varint(mut val: u32, buf: &mut Vec<u8>) {
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn derivation_to_scalar(derivation: &[u8], output_index: u32) -> Scalar {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(derivation);
+    encode_varint(output_index, &mut buf);
+    let hash = keccak256_internal(&buf);
+    Scalar::from_bytes_mod_order(hash)
+}
+
+/// Hash-to-point: H_p(data) = cofactor * elligator2(keccak256(data))
+/// Matches Salvium C++ hash_to_ec / ge_fromfe_frombytes_vartime
+#[wasm_bindgen]
+pub fn hash_to_point(data: &[u8]) -> Vec<u8> {
+    let hash = keccak256_internal(data);
+    let point = elligator2::ge_fromfe_frombytes_vartime(&hash);
+    // Multiply by cofactor 8
+    let cofactored = point + point; // 2P
+    let cofactored = cofactored + cofactored; // 4P
+    let cofactored = cofactored + cofactored; // 8P
+    cofactored.compress().to_bytes().to_vec()
+}
+
+/// Generate key image: KI = sec * H_p(pub)
+#[wasm_bindgen]
+pub fn generate_key_image(pub_key: &[u8], sec_key: &[u8]) -> Vec<u8> {
+    let hash = keccak256_internal(pub_key);
+    let hp = elligator2::ge_fromfe_frombytes_vartime(&hash);
+    // Cofactor multiply
+    let hp8 = {
+        let t = hp + hp;
+        let t = t + t;
+        t + t
+    };
+    let scalar = Scalar::from_bytes_mod_order(to32(sec_key));
+    EdwardsPoint::vartime_multiscalar_mul(&[scalar], &[hp8])
+        .compress().to_bytes().to_vec()
+}
+
+/// Generate key derivation: D = 8 * (sec * pub)
+#[wasm_bindgen]
+pub fn generate_key_derivation(pub_key: &[u8], sec_key: &[u8]) -> Vec<u8> {
+    let point = CompressedEdwardsY(to32(pub_key)).decompress().expect("invalid pub key");
+    let scalar = Scalar::from_bytes_mod_order(to32(sec_key));
+    let shared = scalar * point;
+    // Cofactor multiply by 8
+    let result = {
+        let t = shared + shared;
+        let t = t + t;
+        t + t
+    };
+    result.compress().to_bytes().to_vec()
+}
+
+/// Derive public key: base + H(derivation || index) * G
+#[wasm_bindgen]
+pub fn derive_public_key(derivation: &[u8], output_index: u32, base_pub: &[u8]) -> Vec<u8> {
+    let scalar = derivation_to_scalar(derivation, output_index);
+    let base = CompressedEdwardsY(to32(base_pub)).decompress().expect("invalid base pub key");
+    let derived = ED25519_BASEPOINT_TABLE * &scalar + base;
+    derived.compress().to_bytes().to_vec()
+}
+
+/// Derive secret key: base + H(derivation || index) mod L
+#[wasm_bindgen]
+pub fn derive_secret_key(derivation: &[u8], output_index: u32, base_sec: &[u8]) -> Vec<u8> {
+    let scalar = derivation_to_scalar(derivation, output_index);
+    let base = Scalar::from_bytes_mod_order(to32(base_sec));
+    (base + scalar).to_bytes().to_vec()
+}
+
+// ─── Phase 4: Pedersen Commitments ──────────────────────────────────────────
+
+/// H generator for Pedersen commitments: H = H_p(G)
+/// Precomputed from Salvium/CryptoNote rctTypes.h
+const H_POINT_BYTES: [u8; 32] = [
+    0x8b, 0x65, 0x59, 0x70, 0x15, 0x37, 0x99, 0xaf,
+    0x2a, 0xea, 0xdc, 0x9f, 0xf1, 0xad, 0xd0, 0xea,
+    0x6c, 0x72, 0x51, 0xd5, 0x41, 0x54, 0xcf, 0xa9,
+    0x2c, 0x17, 0x3a, 0x0d, 0xd3, 0x9c, 0x1f, 0x94,
+];
+
+/// Pedersen commitment: C = mask*G + amount*H
+#[wasm_bindgen]
+pub fn pedersen_commit(amount: &[u8], mask: &[u8]) -> Vec<u8> {
+    let amount_scalar = Scalar::from_bytes_mod_order(to32(amount));
+    let mask_scalar = Scalar::from_bytes_mod_order(to32(mask));
+    let h = CompressedEdwardsY(H_POINT_BYTES).decompress().expect("invalid H");
+    // mask*G + amount*H
+    EdwardsPoint::vartime_multiscalar_mul(
+        &[mask_scalar, amount_scalar],
+        &[curve25519_dalek::constants::ED25519_BASEPOINT_POINT, h],
+    ).compress().to_bytes().to_vec()
+}
+
+/// Zero commitment: C = amount*H (no blinding factor)
+#[wasm_bindgen]
+pub fn zero_commit(amount: &[u8]) -> Vec<u8> {
+    let amount_scalar = Scalar::from_bytes_mod_order(to32(amount));
+    let h = CompressedEdwardsY(H_POINT_BYTES).decompress().expect("invalid H");
+    EdwardsPoint::vartime_multiscalar_mul(&[amount_scalar], &[h])
+        .compress().to_bytes().to_vec()
+}
+
+/// Generate commitment mask from shared secret
+/// mask = scReduce32(keccak256("commitment_mask" || sharedSecret))
+#[wasm_bindgen]
+pub fn gen_commitment_mask(shared_secret: &[u8]) -> Vec<u8> {
+    let prefix = b"commitment_mask";
+    let mut data = Vec::with_capacity(prefix.len() + shared_secret.len());
+    data.extend_from_slice(prefix);
+    data.extend_from_slice(shared_secret);
+    let hash = keccak256_internal(&data);
+    Scalar::from_bytes_mod_order(hash).to_bytes().to_vec()
 }

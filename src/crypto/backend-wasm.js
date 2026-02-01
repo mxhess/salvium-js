@@ -76,4 +76,52 @@ export class WasmCryptoBackend {
   pointSubCompressed(p, q) { return this.wasm.point_sub_compressed(p, q); }
   pointNegate(p) { return this.wasm.point_negate(p); }
   doubleScalarMultBase(a, p, b) { return this.wasm.double_scalar_mult_base(a, p, b); }
+
+  // Hash-to-point & key derivation
+  hashToPoint(data) { return this.wasm.hash_to_point(data); }
+  generateKeyImage(pubKey, secKey) { return this.wasm.generate_key_image(pubKey, secKey); }
+  generateKeyDerivation(pubKey, secKey) { return this.wasm.generate_key_derivation(pubKey, secKey); }
+  derivePublicKey(derivation, outputIndex, basePub) { return this.wasm.derive_public_key(derivation, outputIndex, basePub); }
+  deriveSecretKey(derivation, outputIndex, baseSec) { return this.wasm.derive_secret_key(derivation, outputIndex, baseSec); }
+
+  // Pedersen commitments
+  commit(amount, mask) {
+    // Convert amount (BigInt/number) to 32-byte LE scalar
+    let amountBytes = amount;
+    if (typeof amount === 'bigint' || typeof amount === 'number') {
+      let n = BigInt(amount);
+      amountBytes = new Uint8Array(32);
+      for (let i = 0; i < 32 && n > 0n; i++) {
+        amountBytes[i] = Number(n & 0xffn);
+        n >>= 8n;
+      }
+    }
+    // Convert mask if hex string
+    if (typeof mask === 'string') {
+      const hex = mask;
+      mask = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < mask.length; i++) mask[i] = parseInt(hex.substr(i*2, 2), 16);
+    }
+    return this.wasm.pedersen_commit(amountBytes, mask);
+  }
+  zeroCommit(amount) {
+    let amountBytes = amount;
+    if (typeof amount === 'bigint' || typeof amount === 'number') {
+      let n = BigInt(amount);
+      amountBytes = new Uint8Array(32);
+      for (let i = 0; i < 32 && n > 0n; i++) {
+        amountBytes[i] = Number(n & 0xffn);
+        n >>= 8n;
+      }
+    }
+    return this.wasm.zero_commit(amountBytes);
+  }
+  genCommitmentMask(sharedSecret) {
+    if (typeof sharedSecret === 'string') {
+      const hex = sharedSecret;
+      sharedSecret = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < sharedSecret.length; i++) sharedSecret[i] = parseInt(hex.substr(i*2, 2), 16);
+    }
+    return this.wasm.gen_commitment_mask(sharedSecret);
+  }
 }

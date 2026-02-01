@@ -18,6 +18,9 @@ export {
   scReduce32, scReduce64, scInvert, scCheck, scIsZero,
   scalarMultBase, scalarMultPoint, pointAddCompressed,
   pointSubCompressed, pointNegate, doubleScalarMultBase,
+  hashToPoint, generateKeyImage, generateKeyDerivation,
+  derivePublicKey, deriveSecretKey,
+  commit, zeroCommit, genCommitmentMask,
 } from './provider.js';
 
 // Backends (for direct access / testing)

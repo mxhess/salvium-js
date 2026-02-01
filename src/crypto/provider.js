@@ -88,3 +88,15 @@ export function pointAddCompressed(p, q) { return getCryptoBackend().pointAddCom
 export function pointSubCompressed(p, q) { return getCryptoBackend().pointSubCompressed(p, q); }
 export function pointNegate(p) { return getCryptoBackend().pointNegate(p); }
 export function doubleScalarMultBase(a, p, b) { return getCryptoBackend().doubleScalarMultBase(a, p, b); }
+
+// Hash-to-point & key derivation
+export function hashToPoint(data) { return getCryptoBackend().hashToPoint(data); }
+export function generateKeyImage(pubKey, secKey) { return getCryptoBackend().generateKeyImage(pubKey, secKey); }
+export function generateKeyDerivation(pubKey, secKey) { return getCryptoBackend().generateKeyDerivation(pubKey, secKey); }
+export function derivePublicKey(derivation, outputIndex, basePub) { return getCryptoBackend().derivePublicKey(derivation, outputIndex, basePub); }
+export function deriveSecretKey(derivation, outputIndex, baseSec) { return getCryptoBackend().deriveSecretKey(derivation, outputIndex, baseSec); }
+
+// Pedersen commitments
+export function commit(amount, mask) { return getCryptoBackend().commit(amount, mask); }
+export function zeroCommit(amount) { return getCryptoBackend().zeroCommit(amount); }
+export function genCommitmentMask(sharedSecret) { return getCryptoBackend().genCommitmentMask(sharedSecret); }
