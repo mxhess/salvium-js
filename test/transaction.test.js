@@ -1109,7 +1109,7 @@ test('getFeeMultiplier returns correct values', () => {
 });
 
 test('getFeeMultiplier clamps out-of-range priorities', () => {
-  assertEqual(getFeeMultiplier(0), 1n);  // Clamped to 1
+  assertEqual(getFeeMultiplier(0), 5n);  // 0 defaults to priority 2 (Normal) per C++ wallet2.cpp
   assertEqual(getFeeMultiplier(5), 1000n);  // Clamped to 4
 });
 

@@ -287,7 +287,7 @@ test('summarizes basic transaction', () => {
     },
     rct: {
       type: RCT_TYPE.BulletproofPlus,
-      fee: 10000000n,
+      txnFee: 10000000n,
       outPk: [new Uint8Array(32), new Uint8Array(32)]
     }
   };
@@ -422,8 +422,8 @@ test('parseTransaction handles hex string input', () => {
 });
 
 test('parseTransaction extracts version', () => {
-  // version=2, unlock_time=0, vin_count=0, vout_count=0, extra_len=0
-  const txBytes = new Uint8Array([0x02, 0x00, 0x00, 0x00, 0x00]);
+  // version=2, unlock_time=0, vin_count=0, vout_count=0, extra_len=0, txType=0(UNSET), rct_type=0(Null)
+  const txBytes = new Uint8Array([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
   const tx = parseTransaction(txBytes);
 
@@ -431,8 +431,8 @@ test('parseTransaction extracts version', () => {
 });
 
 test('parseTransaction extracts unlock time', () => {
-  // version=2, unlock_time=100, vin_count=0, vout_count=0, extra_len=0
-  const txBytes = new Uint8Array([0x02, 0x64, 0x00, 0x00, 0x00]);
+  // version=2, unlock_time=100, vin_count=0, vout_count=0, extra_len=0, txType=0(UNSET), rct_type=0(Null)
+  const txBytes = new Uint8Array([0x02, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
   const tx = parseTransaction(txBytes);
 

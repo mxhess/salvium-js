@@ -123,6 +123,12 @@ class MockDaemon {
     };
   }
 
+  async getBlocksByHeight(heights) {
+    this.callLog.push(`getBlocksByHeight([${heights.join(',')}])`);
+    // Return failure to trigger individual block fetch fallback
+    return { success: false };
+  }
+
   async getTransactionPool() {
     this.callLog.push('getTransactionPool');
     return {
