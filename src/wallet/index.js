@@ -25,3 +25,6 @@ export {
 
 // Account Class
 export { Account } from './account.js';
+
+// Transfer, Sweep & Stake
+export { transfer, sweep, stake } from './transfer.js';

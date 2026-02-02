@@ -79,9 +79,20 @@ test('Wallet.create() accepts network option', () => {
   assertEqual(wallet.network, NETWORK.TESTNET);
 });
 
-test('Wallet.create() defaults to legacy format', () => {
+test('Wallet.create() derives both legacy and CARROT keys', () => {
   const wallet = Wallet.create();
-  assertEqual(wallet.format, ADDRESS_FORMAT.LEGACY);
+  // Primary keys are legacy CN keys
+  assert(wallet._spendSecretKey, 'Should have legacy spend secret key');
+  assert(wallet._viewSecretKey, 'Should have legacy view secret key');
+  // CARROT keys also present
+  assert(wallet._carrotKeys, 'Should have CARROT keys');
+  assert(wallet._carrotKeys.proveSpendKey, 'Should have prove spend key');
+  assert(wallet._carrotKeys.accountSpendPubkey, 'Should have account spend pubkey');
+  // Both addresses work
+  const legacy = wallet.getLegacyAddress();
+  const carrot = wallet.getCarrotAddress();
+  assertTrue(legacy.startsWith('SaLv'), 'Legacy address has SaLv prefix');
+  assertTrue(carrot.startsWith('SC1'), 'CARROT address has SC1 prefix');
 });
 
 test('createWallet() convenience function works', () => {
@@ -355,10 +366,12 @@ test('toJSON() includes all required fields', () => {
 
   assert(json.type, 'Should have type');
   assert(json.network, 'Should have network');
-  assert(json.format, 'Should have format');
+  assertEqual(json.version, 3, 'Should be version 3');
   assert(json.spendPublicKey, 'Should have spend public key');
   assert(json.viewPublicKey, 'Should have view public key');
-  assert(json.address, 'Should have address');
+  assert(json.address, 'Should have legacy address');
+  assert(json.carrotAddress, 'Should have carrot address');
+  assert(json.carrotKeys, 'Should have carrot keys');
 });
 
 test('toJSON() includes secrets by default', () => {

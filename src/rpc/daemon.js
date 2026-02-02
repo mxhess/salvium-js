@@ -483,7 +483,7 @@ export class DaemonRPC extends RPCClient {
       to_height: options.to_height,
       rct_asset_type: options.rct_asset_type || 'SAL',
       cumulative: options.cumulative || false,
-      binary: options.binary !== false,
+      binary: options.binary || false,
       compress: options.compress || false
     });
   }
@@ -935,7 +935,25 @@ export class DaemonRPC extends RPCClient {
    * @returns {Promise<RPCResponse>} Output indexes
    */
   async getOutputIndexes(txid) {
-    return this.post('/get_o_indexes.bin', { txid });
+    // Binary endpoint using portable storage (epee) format
+    const txidBytes = typeof txid === 'string'
+      ? Uint8Array.from(txid.match(/.{2}/g).map(b => parseInt(b, 16)))
+      : txid;
+    const reqBody = psSerialize({ txid: txidBytes });
+    const resp = await this.postBinary('/get_o_indexes.bin', reqBody);
+    if (!resp.success) return resp;
+    const rawBytes = resp.result;
+    if (!rawBytes || rawBytes.length === 0) {
+      return { success: false, error: { message: 'Empty response from get_o_indexes.bin' } };
+    }
+    const data = psDeserialize(rawBytes);
+    return {
+      success: true,
+      data: {
+        o_indexes: data.o_indexes || [],
+        status: data.status || 'OK'
+      }
+    };
   }
 
   /**

@@ -130,6 +130,9 @@ export class WalletOutput {
     // Salvium-specific
     this.txType = data.txType || 3;                 // TX_TYPE (default: TRANSFER)
 
+    // TX public key (needed to derive output secret key for spending)
+    this.txPubKey = data.txPubKey || null;
+
     // Frozen (user-controlled)
     this.isFrozen = data.isFrozen || false;
 
@@ -195,6 +198,7 @@ export class WalletOutput {
       spentTxHash: this.spentTxHash,
       unlockTime: this.unlockTime.toString(),
       txType: this.txType,
+      txPubKey: this.txPubKey,
       isCarrot: this.isCarrot,
       isFrozen: this.isFrozen,
       createdAt: this.createdAt,

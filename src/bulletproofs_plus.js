@@ -223,49 +223,66 @@ export function parseProof(proofBytes) {
 
   let offset = 0;
 
-  // Read number of commitments (first varint or fixed)
-  // For simplicity, assume V count is derived from L/R length
+  // Salvium binary format: varint(V.len), V[], A, A1, B, r1, s1, d1, varint(L.len), L[], varint(R.len), R[]
 
-  // A - initial commitment
+  // V (commitments)
+  const { value: vCount, bytesRead: vBytes } = _decodeVarint(proofBytes, offset);
+  offset += vBytes;
+  const V = [];
+  for (let i = 0; i < vCount; i++) {
+    V.push(bytesToPoint(proofBytes.slice(offset, offset + 32)));
+    offset += 32;
+  }
+
+  // A, A1, B (points)
   const A = bytesToPoint(proofBytes.slice(offset, offset + 32));
   offset += 32;
-
-  // A1 - final round commitment
   const A1 = bytesToPoint(proofBytes.slice(offset, offset + 32));
   offset += 32;
-
-  // B - final round element
   const B = bytesToPoint(proofBytes.slice(offset, offset + 32));
   offset += 32;
 
-  // r1, s1, d1 - final scalars
+  // r1, s1, d1 (scalars)
   const r1 = bytesToScalar(proofBytes.slice(offset, offset + 32));
   offset += 32;
-
   const s1 = bytesToScalar(proofBytes.slice(offset, offset + 32));
   offset += 32;
-
   const d1 = bytesToScalar(proofBytes.slice(offset, offset + 32));
   offset += 32;
 
-  // Remaining bytes are L and R pairs
-  const remaining = proofBytes.length - offset;
-  if (remaining % 64 !== 0) {
-    throw new Error('Invalid L/R length');
-  }
-
-  const rounds = remaining / 64;
+  // L
+  const { value: lCount, bytesRead: lBytes } = _decodeVarint(proofBytes, offset);
+  offset += lBytes;
   const L = [];
-  const R = [];
-
-  for (let i = 0; i < rounds; i++) {
+  for (let i = 0; i < lCount; i++) {
     L.push(bytesToPoint(proofBytes.slice(offset, offset + 32)));
     offset += 32;
+  }
+
+  // R
+  const { value: rCount, bytesRead: rBytes } = _decodeVarint(proofBytes, offset);
+  offset += rBytes;
+  const R = [];
+  for (let i = 0; i < rCount; i++) {
     R.push(bytesToPoint(proofBytes.slice(offset, offset + 32)));
     offset += 32;
   }
 
-  return { A, A1, B, r1, s1, d1, L, R };
+  return { V, A, A1, B, r1, s1, d1, L, R };
+}
+
+function _decodeVarint(bytes, offset) {
+  let value = 0;
+  let shift = 0;
+  let bytesRead = 0;
+  while (offset + bytesRead < bytes.length) {
+    const byte = bytes[offset + bytesRead];
+    bytesRead++;
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) break;
+    shift += 7;
+  }
+  return { value, bytesRead };
 }
 
 /**
@@ -1016,31 +1033,60 @@ export function bulletproofPlusProve(amounts, masks) {
  * Serialize a Bulletproof+ proof to bytes
  */
 export function serializeProof(proof) {
-  const { A, A1, B, r1, s1, d1, L, R } = proof;
+  const { V, A, A1, B, r1, s1, d1, L, R } = proof;
 
-  // Calculate total size: A + A1 + B + r1 + s1 + d1 + L + R
-  // = 3*32 + 3*32 + 2*L.length*32
-  const size = 32 * 6 + 64 * L.length;
-  const bytes = new Uint8Array(size);
-  let offset = 0;
+  // Monero/Salvium binary format for BulletproofPlus:
+  //   varint(V.length), V[0..n] (32 bytes each)
+  //   A (32), A1 (32), B (32)
+  //   r1 (32), s1 (32), d1 (32)
+  //   varint(L.length), L[0..n] (32 bytes each)
+  //   varint(R.length), R[0..n] (32 bytes each)
+
+  const chunks = [];
+
+  // V (commitments)
+  chunks.push(_encodeVarint(V.length));
+  for (const v of V) chunks.push(v.toBytes());
 
   // A, A1, B (points)
-  bytes.set(A.toBytes(), offset); offset += 32;
-  bytes.set(A1.toBytes(), offset); offset += 32;
-  bytes.set(B.toBytes(), offset); offset += 32;
+  chunks.push(A.toBytes());
+  chunks.push(A1.toBytes());
+  chunks.push(B.toBytes());
 
   // r1, s1, d1 (scalars)
-  bytes.set(scalarToBytes(r1), offset); offset += 32;
-  bytes.set(scalarToBytes(s1), offset); offset += 32;
-  bytes.set(scalarToBytes(d1), offset); offset += 32;
+  chunks.push(scalarToBytes(r1));
+  chunks.push(scalarToBytes(s1));
+  chunks.push(scalarToBytes(d1));
 
-  // L and R pairs
-  for (let i = 0; i < L.length; i++) {
-    bytes.set(L[i].toBytes(), offset); offset += 32;
-    bytes.set(R[i].toBytes(), offset); offset += 32;
+  // L
+  chunks.push(_encodeVarint(L.length));
+  for (const l of L) chunks.push(l.toBytes());
+
+  // R
+  chunks.push(_encodeVarint(R.length));
+  for (const r of R) chunks.push(r.toBytes());
+
+  // Concatenate
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const bytes = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.length;
   }
-
   return bytes;
+}
+
+function _encodeVarint(value) {
+  const bytes = [];
+  let v = value;
+  while (v >= 0x80) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  bytes.push(v);
+  return new Uint8Array(bytes);
 }
 
 /**

@@ -93,6 +93,10 @@ export class WalletSync {
     this.keys = options.keys;
     this.carrotKeys = options.carrotKeys || null;
     this.subaddresses = options.subaddresses || new Map();
+    // Always include the primary address in subaddress map
+    if (this.keys?.spendPublicKey && !this.subaddresses.has(this.keys.spendPublicKey)) {
+      this.subaddresses.set(this.keys.spendPublicKey, { major: 0, minor: 0 });
+    }
     this.carrotSubaddresses = options.carrotSubaddresses || new Map();
     this.batchSize = options.batchSize || DEFAULT_BATCH_SIZE;
 
@@ -963,6 +967,7 @@ export class WalletSync {
           subaddressIndex: scanResult.subaddressIndex,
           unlockTime: tx.prefix?.unlockTime || 0n,
           txType,
+          txPubKey: txPubKey ? bytesToHex(txPubKey) : null,
           isCarrot: scanResult.isCarrot || false
         });
 

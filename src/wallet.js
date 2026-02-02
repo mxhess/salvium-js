@@ -84,22 +84,20 @@ export class Wallet {
    * @param {Object} options - Wallet options
    * @param {string} options.type - Wallet type (full, view_only, watch)
    * @param {string} options.network - Network (mainnet, testnet, stagenet)
-   * @param {string} options.format - Address format (legacy, carrot)
    * @private - Use static factory methods instead
    */
   constructor(options = {}) {
     this.type = options.type || WALLET_TYPE.FULL;
     this.network = options.network || NETWORK.MAINNET;
-    this.format = options.format || ADDRESS_FORMAT.LEGACY;
 
-    // Key material (set by factory methods)
+    // Legacy CryptoNote key material (primary keys, set by factory methods)
     this._seed = null;
     this._spendSecretKey = null;
     this._spendPublicKey = null;
     this._viewSecretKey = null;
     this._viewPublicKey = null;
 
-    // CARROT additional keys (if using CARROT format)
+    // CARROT keys (always derived alongside legacy keys from same seed)
     this._carrotKeys = null;
 
     // Account management
@@ -143,35 +141,22 @@ export class Wallet {
 
   /**
    * Create a new random wallet
+   *
+   * Always derives both legacy CryptoNote AND CARROT keys from the same seed,
+   * matching Salvium C++ behavior (carrot_and_legacy_account::generate).
+   *
    * @param {Object} options - Wallet options
    * @param {string} options.network - Network (default: mainnet)
-   * @param {string} options.format - Address format (default: legacy)
-   * @returns {Wallet} New wallet instance
+   * @returns {Wallet} New wallet instance with both key sets
    */
   static create(options = {}) {
     const wallet = new Wallet({
       type: WALLET_TYPE.FULL,
-      network: options.network || NETWORK.MAINNET,
-      format: options.format || ADDRESS_FORMAT.LEGACY
+      network: options.network || NETWORK.MAINNET
     });
 
-    // Generate random seed
     wallet._seed = generateSeed();
-
-    // Derive keys based on format
-    if (wallet.format === ADDRESS_FORMAT.CARROT) {
-      wallet._carrotKeys = deriveCarrotKeys(wallet._seed);
-      wallet._spendSecretKey = wallet._carrotKeys.spendSecretKey;
-      wallet._spendPublicKey = wallet._carrotKeys.spendPublicKey;
-      wallet._viewSecretKey = wallet._carrotKeys.viewSecretKey;
-      wallet._viewPublicKey = wallet._carrotKeys.viewPublicKey;
-    } else {
-      const keys = deriveKeys(wallet._seed);
-      wallet._spendSecretKey = keys.spendSecretKey;
-      wallet._spendPublicKey = keys.spendPublicKey;
-      wallet._viewSecretKey = keys.viewSecretKey;
-      wallet._viewPublicKey = keys.viewPublicKey;
-    }
+    wallet._deriveAllKeys();
 
     return wallet;
   }
@@ -181,7 +166,6 @@ export class Wallet {
    * @param {string} mnemonic - 25-word mnemonic phrase
    * @param {Object} options - Wallet options
    * @param {string} options.network - Network (default: mainnet)
-   * @param {string} options.format - Address format (default: legacy)
    * @param {string} options.language - Mnemonic language (default: english)
    * @returns {Wallet} Restored wallet instance
    */
@@ -207,32 +191,16 @@ export class Wallet {
    * Restore wallet from 32-byte seed
    * @param {Uint8Array|string} seed - 32-byte seed
    * @param {Object} options - Wallet options
-   * @returns {Wallet} Restored wallet instance
+   * @returns {Wallet} Restored wallet instance with both key sets
    */
   static fromSeed(seed, options = {}) {
     const wallet = new Wallet({
       type: WALLET_TYPE.FULL,
-      network: options.network || NETWORK.MAINNET,
-      format: options.format || ADDRESS_FORMAT.LEGACY
+      network: options.network || NETWORK.MAINNET
     });
 
-    // Store seed
     wallet._seed = typeof seed === 'string' ? hexToBytes(seed) : seed;
-
-    // Derive keys
-    if (wallet.format === ADDRESS_FORMAT.CARROT) {
-      wallet._carrotKeys = deriveCarrotKeys(wallet._seed);
-      wallet._spendSecretKey = wallet._carrotKeys.spendSecretKey;
-      wallet._spendPublicKey = wallet._carrotKeys.spendPublicKey;
-      wallet._viewSecretKey = wallet._carrotKeys.viewSecretKey;
-      wallet._viewPublicKey = wallet._carrotKeys.viewPublicKey;
-    } else {
-      const keys = deriveKeys(wallet._seed);
-      wallet._spendSecretKey = keys.spendSecretKey;
-      wallet._spendPublicKey = keys.spendPublicKey;
-      wallet._viewSecretKey = keys.viewSecretKey;
-      wallet._viewPublicKey = keys.viewPublicKey;
-    }
+    wallet._deriveAllKeys();
 
     return wallet;
   }
@@ -247,8 +215,7 @@ export class Wallet {
   static fromViewKey(viewSecretKey, spendPublicKey, options = {}) {
     const wallet = new Wallet({
       type: WALLET_TYPE.VIEW_ONLY,
-      network: options.network || NETWORK.MAINNET,
-      format: options.format || ADDRESS_FORMAT.LEGACY
+      network: options.network || NETWORK.MAINNET
     });
 
     wallet._viewSecretKey = typeof viewSecretKey === 'string'
@@ -278,14 +245,43 @@ export class Wallet {
 
     const wallet = new Wallet({
       type: WALLET_TYPE.WATCH,
-      network: parsed.network,
-      format: parsed.format
+      network: parsed.network
     });
 
     wallet._spendPublicKey = parsed.spendPublicKey;
     wallet._viewPublicKey = parsed.viewPublicKey;
 
     return wallet;
+  }
+
+  // ===========================================================================
+  // KEY DERIVATION
+  // ===========================================================================
+
+  /**
+   * Derive both legacy CryptoNote AND CARROT keys from seed.
+   *
+   * Matches Salvium C++ carrot_and_legacy_account::generate():
+   *   - Legacy CN keys: deriveKeys(seed)
+   *   - CARROT keys: deriveCarrotKeys(seed), where s_master = spend_secret_key
+   *
+   * Primary keys (_spendSecretKey, _viewSecretKey, etc.) are always legacy CN keys
+   * for backward compatibility with scanning, signing, and transfer code.
+   *
+   * @private
+   */
+  _deriveAllKeys() {
+    if (!this._seed) throw new Error('Seed required to derive keys');
+
+    // Legacy CryptoNote keys (primary)
+    const legacyKeys = deriveKeys(this._seed);
+    this._spendSecretKey = legacyKeys.spendSecretKey;
+    this._spendPublicKey = legacyKeys.spendPublicKey;
+    this._viewSecretKey = legacyKeys.viewSecretKey;
+    this._viewPublicKey = legacyKeys.viewPublicKey;
+
+    // CARROT keys (s_master = spend_secret_key in C++)
+    this._carrotKeys = deriveCarrotKeys(this._seed);
   }
 
   // ===========================================================================
@@ -435,31 +431,88 @@ export class Wallet {
   // ===========================================================================
 
   /**
-   * Get the main wallet address
-   * @param {boolean} carrot - Use CARROT format (default: use wallet default)
+   * Get the main wallet address.
+   *
+   * Without arguments, returns the legacy address (pre-CARROT HF) or CARROT
+   * address (post-CARROT HF) based on the wallet's sync height.
+   *
+   * @param {string|null} format - Explicit format ('legacy' or 'carrot'), or null for auto
    * @returns {string} Main address
    */
-  getAddress(carrot = null) {
-    const format = carrot === null ? this.format :
-      (carrot ? ADDRESS_FORMAT.CARROT : ADDRESS_FORMAT.LEGACY);
-
-    if (format === this.format && this._mainAddress) {
-      return this._mainAddress;
+  getAddress(format = null) {
+    // Resolve format: explicit > height-based > legacy fallback
+    if (format === null) {
+      format = isCarrotActive(this._syncHeight || 0, this._resolveNetworkId())
+        ? ADDRESS_FORMAT.CARROT : ADDRESS_FORMAT.LEGACY;
     }
+    // Backward compat: getAddress(true) / getAddress(false)
+    if (format === true) format = ADDRESS_FORMAT.CARROT;
+    if (format === false) format = ADDRESS_FORMAT.LEGACY;
+
+    // Use CARROT keys for CARROT address, legacy keys for legacy address
+    const { spendPub, viewPub } = this._keysForFormat(format);
+
+    const cacheKey = `main_${format}`;
+    if (this._subaddresses.has(cacheKey)) return this._subaddresses.get(cacheKey);
 
     const address = createAddress({
-      spendPublicKey: this._spendPublicKey,
-      viewPublicKey: this._viewPublicKey,
+      spendPublicKey: spendPub,
+      viewPublicKey: viewPub,
       network: this.network,
-      format: format,
+      format,
       type: 'standard'
     });
 
-    if (format === this.format) {
-      this._mainAddress = address;
-    }
-
+    this._subaddresses.set(cacheKey, address);
     return address;
+  }
+
+  /**
+   * Get legacy CryptoNote address (SaLv...)
+   * @returns {string} Legacy address
+   */
+  getLegacyAddress() {
+    return this.getAddress(ADDRESS_FORMAT.LEGACY);
+  }
+
+  /**
+   * Get CARROT address (SC1...)
+   * @returns {string|null} CARROT address, or null if CARROT keys unavailable
+   */
+  getCarrotAddress() {
+    if (!this._carrotKeys) return null;
+    return this.getAddress(ADDRESS_FORMAT.CARROT);
+  }
+
+  /**
+   * Return the appropriate public keys for the given address format.
+   * @param {string} format - 'legacy' or 'carrot'
+   * @returns {{spendPub: Uint8Array, viewPub: Uint8Array}}
+   * @private
+   */
+  _keysForFormat(format) {
+    if (format === ADDRESS_FORMAT.CARROT && this._carrotKeys) {
+      return {
+        spendPub: typeof this._carrotKeys.accountSpendPubkey === 'string'
+          ? hexToBytes(this._carrotKeys.accountSpendPubkey) : this._carrotKeys.accountSpendPubkey,
+        viewPub: typeof this._carrotKeys.primaryAddressViewPubkey === 'string'
+          ? hexToBytes(this._carrotKeys.primaryAddressViewPubkey) : this._carrotKeys.primaryAddressViewPubkey
+      };
+    }
+    return {
+      spendPub: this._spendPublicKey,
+      viewPub: this._viewPublicKey
+    };
+  }
+
+  /**
+   * Resolve network string to NETWORK_ID number for consensus functions.
+   * @returns {number}
+   * @private
+   */
+  _resolveNetworkId() {
+    const map = { mainnet: NETWORK_ID.MAINNET, testnet: NETWORK_ID.TESTNET, stagenet: NETWORK_ID.STAGENET };
+    return map[this.network] ?? NETWORK_ID.MAINNET;
   }
 
   /**
@@ -495,7 +548,7 @@ export class Wallet {
       spendPublicKey: keys.spendPublicKey,
       viewPublicKey: keys.viewPublicKey,
       network: this.network,
-      format: this.format,
+      format: ADDRESS_FORMAT.LEGACY, // Subaddresses use legacy CN keys
       type: 'subaddress'
     });
 
@@ -513,18 +566,25 @@ export class Wallet {
   /**
    * Generate an integrated address with payment ID
    * @param {string} paymentId - 8-byte payment ID (hex)
-   * @param {boolean} carrot - Use CARROT format
+   * @param {string|null} format - Address format (null = auto based on height)
    * @returns {string} Integrated address
    */
-  getIntegratedAddress(paymentId, carrot = null) {
-    const format = carrot === null ? this.format :
-      (carrot ? ADDRESS_FORMAT.CARROT : ADDRESS_FORMAT.LEGACY);
+  getIntegratedAddress(paymentId, format = null) {
+    if (format === null) {
+      format = isCarrotActive(this._syncHeight || 0, this._resolveNetworkId())
+        ? ADDRESS_FORMAT.CARROT : ADDRESS_FORMAT.LEGACY;
+    }
+    // Backward compat: getIntegratedAddress(id, true/false)
+    if (format === true) format = ADDRESS_FORMAT.CARROT;
+    if (format === false) format = ADDRESS_FORMAT.LEGACY;
+
+    const { spendPub, viewPub } = this._keysForFormat(format);
 
     return createAddress({
-      spendPublicKey: this._spendPublicKey,
-      viewPublicKey: this._viewPublicKey,
+      spendPublicKey: spendPub,
+      viewPublicKey: viewPub,
       network: this.network,
-      format: format,
+      format,
       type: 'integrated',
       paymentId
     });
@@ -1841,14 +1901,22 @@ export class Wallet {
    */
   toJSON(includeSecrets = true) {
     const data = {
-      version: 2,
+      version: 3,
       type: this.type,
       network: this.network,
-      format: this.format,
+      // Legacy CN public keys
       spendPublicKey: bytesToHex(this._spendPublicKey),
       viewPublicKey: bytesToHex(this._viewPublicKey),
+      // Both addresses
+      address: this.getLegacyAddress(),
+      carrotAddress: this._carrotKeys ? this.getCarrotAddress() : null,
+      // CARROT public keys
+      carrotKeys: this._carrotKeys ? {
+        accountSpendPubkey: this._carrotKeys.accountSpendPubkey,
+        primaryAddressViewPubkey: this._carrotKeys.primaryAddressViewPubkey,
+        accountViewPubkey: this._carrotKeys.accountViewPubkey
+      } : null,
       syncHeight: this._syncHeight,
-      address: this.getAddress(),
       accounts: this._accounts.map(a => ({
         index: a.index,
         label: a.label
@@ -1859,12 +1927,17 @@ export class Wallet {
     if (includeSecrets) {
       if (this._seed) {
         data.seed = bytesToHex(this._seed);
+        data.mnemonic = seedToMnemonic(this._seed);
       }
       if (this._spendSecretKey) {
         data.spendSecretKey = bytesToHex(this._spendSecretKey);
       }
       if (this._viewSecretKey) {
         data.viewSecretKey = bytesToHex(this._viewSecretKey);
+      }
+      // Full CARROT secrets (for completeness; can be re-derived from seed)
+      if (this._carrotKeys) {
+        data.carrotKeys = { ...this._carrotKeys };
       }
     }
 
@@ -1879,32 +1952,29 @@ export class Wallet {
   static fromJSON(data) {
     let wallet;
 
-    // Determine how to restore based on available data
     if (data.seed) {
-      wallet = Wallet.fromSeed(data.seed, {
-        network: data.network,
-        format: data.format
-      });
+      // Best case: re-derive all keys from seed (seamless v2→v3 upgrade)
+      wallet = Wallet.fromSeed(data.seed, { network: data.network });
     } else if (data.spendSecretKey) {
       wallet = new Wallet({
         type: WALLET_TYPE.FULL,
-        network: data.network,
-        format: data.format
+        network: data.network
       });
       wallet._spendSecretKey = hexToBytes(data.spendSecretKey);
       wallet._spendPublicKey = hexToBytes(data.spendPublicKey);
       wallet._viewSecretKey = data.viewSecretKey ? hexToBytes(data.viewSecretKey) : null;
       wallet._viewPublicKey = hexToBytes(data.viewPublicKey);
+      // Restore CARROT keys if stored (no seed to re-derive)
+      if (data.carrotKeys && data.carrotKeys.proveSpendKey) {
+        wallet._carrotKeys = data.carrotKeys;
+      }
     } else if (data.viewSecretKey) {
-      wallet = Wallet.fromViewKey(
-        data.viewSecretKey,
-        data.spendPublicKey,
-        { network: data.network, format: data.format }
-      );
+      wallet = Wallet.fromViewKey(data.viewSecretKey, data.spendPublicKey, {
+        network: data.network
+      });
     } else {
-      wallet = Wallet.fromAddress(data.address, {
-        network: data.network,
-        format: data.format
+      wallet = Wallet.fromAddress(data.address || data.carrotAddress, {
+        network: data.network
       });
     }
 

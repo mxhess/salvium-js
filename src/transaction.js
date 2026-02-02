@@ -18,6 +18,7 @@ import {
   hashToPoint, generateKeyImage,
 } from './crypto/index.js';
 import { bytesToHex, hexToBytes } from './address.js';
+import { bulletproofPlusProve, serializeProof as serializeBpPlus } from './bulletproofs_plus.js';
 
 // =============================================================================
 // RE-EXPORTS FROM SUBMODULES
@@ -1698,19 +1699,16 @@ export function buildTransaction(params, options = {}) {
   }
 
   // Generate Bulletproofs+ range proofs for outputs
-  // Note: This requires the proveRangeMultiple function from bulletproofs_plus.js
-  let bulletproofPlus = null;
-  try {
-    // Import dynamically if needed, or assume caller handles proofs separately
-    // For now, we note that range proofs should be generated
-    bulletproofPlus = {
-      // Range proof would be generated here
-      // proof: proveRangeMultiple(outputs.map(o => o.amount), outputMasks)
-      note: 'Range proof generation requires proveRangeMultiple'
-    };
-  } catch (e) {
-    // Range proofs can be added after
-  }
+  const bpAmounts = outputs.map(o => o.amount);
+  const bpMasks = outputMasks.map(m => {
+    const bytes = typeof m === 'string' ? hexToBytes(m) : m;
+    return _bytesToBigInt(bytes);
+  });
+  const bpProof = bulletproofPlusProve(bpAmounts, bpMasks);
+  const bulletproofPlus = {
+    ...bpProof,
+    serialized: serializeBpPlus(bpProof)
+  };
 
   // Assemble complete transaction
   const transaction = {
@@ -2309,15 +2307,17 @@ export function signTransaction(unsignedTx, secrets) {
 export async function prepareInputs(ownedOutputs, rpcClient, options = {}) {
   const { ringSize = DEFAULT_RING_SIZE, rctOffsets } = options;
 
+  // Fetch output distribution once (not per-input)
+  let offsets = rctOffsets;
+  if (!offsets && rpcClient) {
+    const distResp = await rpcClient.getOutputDistribution([0], { cumulative: true });
+    const dist = distResp.result?.distributions?.[0] || distResp.distributions?.[0];
+    offsets = dist?.distribution || [];
+  }
+
   const preparedInputs = [];
 
   for (const output of ownedOutputs) {
-    // Get global output distribution if not provided
-    let offsets = rctOffsets;
-    if (!offsets && rpcClient) {
-      const histogram = await rpcClient.getOutputHistogram({ amounts: [0] });
-      offsets = histogram.histogram[0]?.recent_outputs_offsets || [];
-    }
 
     // Select decoy indices
     const decoyIndices = selectDecoys(
@@ -2330,13 +2330,13 @@ export async function prepareInputs(ownedOutputs, rpcClient, options = {}) {
     // Fetch ring member keys and commitments
     let ring, ringCommitments;
     if (rpcClient) {
-      const outsResponse = await rpcClient.getOuts({
-        outputs: decoyIndices.map(i => ({ amount: 0, index: i })),
-        get_txid: false
-      });
+      const outsResponse = await rpcClient.getOuts(
+        decoyIndices.map(i => ({ amount: 0, index: i }))
+      );
 
-      ring = outsResponse.outs.map(o => hexToBytes(o.key));
-      ringCommitments = outsResponse.outs.map(o => hexToBytes(o.mask));
+      const outs = outsResponse.result?.outs || outsResponse.outs || [];
+      ring = outs.map(o => hexToBytes(o.key));
+      ringCommitments = outs.map(o => hexToBytes(o.mask));
     } else {
       // Placeholder for testing
       ring = decoyIndices.map(() => new Uint8Array(32));

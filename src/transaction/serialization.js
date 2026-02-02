@@ -744,61 +744,39 @@ export function serializeTransaction(tx) {
     extra: tx.prefix.extra
   };
 
-  // Serialize prefix
-  const prefixBytes = serializeTxPrefix(prefixForSerialization);
+  const chunks = [];
 
-  // Serialize RingCT base
-  const rctBaseBytes = serializeRctBase(tx.rct);
+  // 1. TX prefix
+  chunks.push(serializeTxPrefix(prefixForSerialization));
 
-  // Serialize CLSAG signatures
-  const clsagBytes = [];
-  for (const sig of tx.rct.CLSAGs) {
-    clsagBytes.push(serializeCLSAG(sig));
-  }
+  // 2. RCT base: type + fee + ecdhInfo + outPk
+  //    (matches Salvium serialize_rctsig_base)
+  chunks.push(serializeRctBase(tx.rct));
+  chunks.push(serializeEcdhInfo(tx.rct.ecdhInfo));
+  chunks.push(serializeOutPk(tx.rct.outPk));
 
-  // Serialize output commitments
-  const outPkBytes = serializeOutPk(tx.rct.outPk);
+  // 3. RCT prunable: BP+ proofs, CLSAGs, pseudoOuts
+  //    (matches Salvium serialize_rctsig_prunable)
 
-  // Serialize ECDH info
-  const ecdhBytes = serializeEcdhInfo(tx.rct.ecdhInfo);
-
-  // Combine all parts
-  let totalLen = prefixBytes.length + rctBaseBytes.length;
-  for (const cb of clsagBytes) {
-    totalLen += cb.length;
-  }
-  totalLen += outPkBytes.length + ecdhBytes.length;
-
-  // Add Bulletproof+ proof if present
-  let bpBytes = new Uint8Array(0);
+  // BP+ proofs (varint count + proof data)
   if (tx.rct.bulletproofPlus && tx.rct.bulletproofPlus.serialized) {
-    bpBytes = tx.rct.bulletproofPlus.serialized;
-    totalLen += bpBytes.length;
+    chunks.push(encodeVarint(1)); // number of BP+ proofs (always 1 aggregated)
+    chunks.push(tx.rct.bulletproofPlus.serialized);
+  } else {
+    chunks.push(encodeVarint(0));
   }
 
-  const result = new Uint8Array(totalLen);
-  let offset = 0;
-
-  result.set(prefixBytes, offset);
-  offset += prefixBytes.length;
-
-  result.set(rctBaseBytes, offset);
-  offset += rctBaseBytes.length;
-
-  for (const cb of clsagBytes) {
-    result.set(cb, offset);
-    offset += cb.length;
+  // CLSAGs
+  for (const sig of tx.rct.CLSAGs) {
+    chunks.push(serializeCLSAG(sig));
   }
 
-  result.set(outPkBytes, offset);
-  offset += outPkBytes.length;
-
-  result.set(ecdhBytes, offset);
-  offset += ecdhBytes.length;
-
-  if (bpBytes.length > 0) {
-    result.set(bpBytes, offset);
+  // pseudoOuts (in prunable section for BP+ types)
+  if (tx.rct.pseudoOuts) {
+    for (const po of tx.rct.pseudoOuts) {
+      chunks.push(typeof po === 'string' ? hexToBytes(po) : po);
+    }
   }
 
-  return result;
+  return concatBytes(chunks);
 }

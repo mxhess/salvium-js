@@ -245,31 +245,48 @@ test('multiScalarMul with empty arrays', () => {
 console.log('\n--- Proof Parsing Tests ---');
 
 test('parseProof extracts correct structure', () => {
-  // Create a minimal mock proof (6 rounds = 384 bytes for L/R + 192 bytes header)
-  const proofBytes = new Uint8Array(32 * 6 + 64 * 6);
-
-  // Fill with valid point encodings (use base point bytes)
+  // Build a proof in Salvium binary format:
+  // varint(V.len), V[], A, A1, B, r1, s1, d1, varint(L.len), L[], varint(R.len), R[]
   const baseBytes = Point.BASE.toBytes();
+  const chunks = [];
+
+  // V: 1 commitment
+  chunks.push(new Uint8Array([1])); // varint(1)
+  chunks.push(baseBytes);
 
   // A, A1, B
-  for (let i = 0; i < 3; i++) {
-    proofBytes.set(baseBytes, i * 32);
-  }
+  chunks.push(baseBytes);
+  chunks.push(baseBytes);
+  chunks.push(baseBytes);
 
-  // r1, s1, d1 (scalars - just use small values)
-  proofBytes[96] = 1; // r1
-  proofBytes[128] = 2; // s1
-  proofBytes[160] = 3; // d1
+  // r1, s1, d1 (scalars)
+  const s1b = new Uint8Array(32); s1b[0] = 1;
+  const s2b = new Uint8Array(32); s2b[0] = 2;
+  const s3b = new Uint8Array(32); s3b[0] = 3;
+  chunks.push(s1b);
+  chunks.push(s2b);
+  chunks.push(s3b);
 
-  // L and R pairs (6 rounds)
-  for (let i = 0; i < 12; i++) {
-    proofBytes.set(baseBytes, 192 + i * 32);
-  }
+  // L: 6 entries
+  chunks.push(new Uint8Array([6])); // varint(6)
+  for (let i = 0; i < 6; i++) chunks.push(baseBytes);
+
+  // R: 6 entries
+  chunks.push(new Uint8Array([6])); // varint(6)
+  for (let i = 0; i < 6; i++) chunks.push(baseBytes);
+
+  // Concatenate
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const proofBytes = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) { proofBytes.set(c, off); off += c.length; }
 
   const proof = parseProof(proofBytes);
   assertExists(proof.A);
   assertExists(proof.A1);
   assertExists(proof.B);
+  assertEqual(proof.V.length, 1);
   assertEqual(proof.r1, 1n);
   assertEqual(proof.s1, 2n);
   assertEqual(proof.d1, 3n);
@@ -450,8 +467,9 @@ test('serializeProof produces correct size', () => {
   const proof = proveRange(amount, mask);
   const bytes = serializeProof(proof);
 
-  // Size = 3 points + 3 scalars + 6 L/R pairs = 6*32 + 6*64 = 576 bytes
-  assertEqual(bytes.length, 576, 'Serialized proof should be 576 bytes');
+  // Salvium binary format: varint(V.len) + V + A + A1 + B + r1 + s1 + d1 + varint(L.len) + L + varint(R.len) + R
+  // For single amount: 1 + 32 + 3*32 + 3*32 + 1 + 6*32 + 1 + 6*32 = 611 bytes
+  assertEqual(bytes.length, 611, 'Serialized proof should be 611 bytes');
 });
 
 test('serialized proof can be parsed and verified', () => {

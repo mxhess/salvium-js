@@ -36,6 +36,7 @@ export * from './offline.js';
 export * from './multisig.js';
 export * from './wallet-store.js';
 export * from './wallet-sync.js';
+export { transfer, sweep, stake } from './wallet/transfer.js';
 export * from './persistent-wallet.js';
 export * from './consensus.js';
 
