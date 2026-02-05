@@ -18,7 +18,7 @@ import { hexToBytes, bytesToHex } from '../address.js';
 import { edwardsToMontgomeryU, x25519ScalarMult } from '../carrot-scanning.js';
 import {
   blake2b, scalarMultBase, scalarMultPoint, pointAddCompressed,
-  scReduce32, commit, getGeneratorT,
+  scReduce64, commit, getGeneratorT,
 } from '../crypto/index.js';
 
 import { CARROT_DOMAIN, CARROT_ENOTE_TYPE } from './constants.js';
@@ -93,7 +93,8 @@ function carrotHash32(domain, key, ...data) {
 function carrotHashToScalar(domain, key, ...data) {
   const transcript = buildTranscript(domain, normalizeData(data));
   const hash64 = blake2b(transcript, 64, key || null);
-  return scReduce32(hash64);
+  // Use scReduce64 for 64-byte hash output (NOT scReduce32 which is for 32-byte inputs)
+  return scReduce64(hash64);
 }
 
 /**
@@ -153,23 +154,26 @@ export function buildRingCtInputContext(firstKeyImage) {
 
 /**
  * Build input context for coinbase transaction
- * Format: 'C' || block_height (8 bytes, little-endian)
+ * Format: 'C' || block_height (8 bytes, little-endian) || zeros (24 bytes)
+ * Total: 33 bytes (matching C++ input_context_t structure)
  *
  * @param {bigint|number} blockHeight - Block height
- * @returns {Uint8Array} 9-byte input context
+ * @returns {Uint8Array} 33-byte input context
  */
 export function buildCoinbaseInputContext(blockHeight) {
   if (typeof blockHeight === 'number') blockHeight = BigInt(blockHeight);
 
-  const context = new Uint8Array(9);
+  // input_context_t is always 33 bytes: 1 byte type + 32 bytes data
+  const context = new Uint8Array(33);
   context[0] = CARROT_DOMAIN.INPUT_CONTEXT_COINBASE.charCodeAt(0);
 
-  // Little-endian 8-byte height
+  // Little-endian 8-byte height at bytes 1-8
   let h = blockHeight;
   for (let i = 1; i < 9; i++) {
     context[i] = Number(h & 0xffn);
     h >>= 8n;
   }
+  // Bytes 9-32 are already zero (padding)
 
   return context;
 }

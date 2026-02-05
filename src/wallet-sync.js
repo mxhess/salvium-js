@@ -13,7 +13,7 @@
 import { WalletOutput, WalletTransaction } from './wallet-store.js';
 import { cnSubaddressSecretKey, carrotIndexExtensionGenerator, carrotSubaddressScalar } from './subaddress.js';
 import { scanCarrotOutput, makeInputContext, makeInputContextCoinbase, generateCarrotKeyImage } from './carrot-scanning.js';
-import { parseTransaction, parseBlock, extractTxPubKey, extractPaymentId } from './transaction.js';
+import { parseTransaction, parseBlock, extractTxPubKey, extractPaymentId, extractAdditionalPubKeys } from './transaction.js';
 import { bytesToHex, hexToBytes } from './address.js';
 import { TX_TYPE } from './wallet.js';
 import {
@@ -942,13 +942,21 @@ export class WalletSync {
       // CARROT outputs have: 3-byte view tag, enote ephemeral pubkey
       const isCarrotOutput = this._isCarrotOutput(output);
 
-
       if (isCarrotOutput && this.carrotKeys) {
         // CARROT scanning - pass txPubKey (D_e) from tx_extra
         scanResult = await this._scanCarrotOutput(output, i, tx, txHash, txPubKey, header);
       } else if (txPubKey && this.keys.viewSecretKey) {
         // CryptoNote (legacy) scanning
-        scanResult = await this._scanCNOutput(output, i, tx, txHash, txPubKey, header);
+        // Skip if output is CARROT type but we couldn't scan it (missing carrotKeys or failed scan)
+        if (output.type === 0x04) {
+          continue; // CARROT output - don't try CN scanning
+        }
+        try {
+          scanResult = await this._scanCNOutput(output, i, tx, txHash, txPubKey, header);
+        } catch (e) {
+          // Key derivation can fail for malformed outputs - skip silently
+          continue;
+        }
       }
 
       if (scanResult) {
@@ -969,6 +977,8 @@ export class WalletSync {
           txType,
           txPubKey: txPubKey ? bytesToHex(txPubKey) : null,
           isCarrot: scanResult.isCarrot || false,
+          carrotEphemeralPubkey: scanResult.carrotEphemeralPubkey || null,
+          carrotSharedSecret: scanResult.carrotSharedSecret || null,
           assetType: output.assetType || 'SAL'
         });
 
@@ -1063,14 +1073,32 @@ export class WalletSync {
       amountCommitment = pedersonCommit(clearAmount, scalarOne);
     }
 
-    // Use the passed txPubKey (D_e) as the enote ephemeral pubkey
-    // It was extracted from tx_extra by the caller
-    // For per-output ephemeral pubkeys, check additionalPubKeys
-    let enoteEphemeralPubkey = txPubKey;
-    if (!enoteEphemeralPubkey && tx.prefix?.extra?.additionalPubKeys?.[outputIndex]) {
-      // Per-output ephemeral pubkeys
-      const pubKey = tx.prefix.extra.additionalPubKeys[outputIndex];
-      enoteEphemeralPubkey = typeof pubKey === 'string' ? hexToBytes(pubKey) : pubKey;
+    // For CARROT outputs, the enote ephemeral pubkey (D_e) comes from:
+    // 1. For SalviumOne (RCT type 9): txPubKey in tx_extra (D_e = d_e * B, X25519)
+    // 2. For SalviumZero (RCT type 8): txPubKey in tx_extra
+    //    NOTE: p_r is the mask difference commitment (for RCT balance equation),
+    //    NOT the CARROT ephemeral pubkey. D_e is always stored as txPubKey.
+    // 3. For older types: additional_pubkeys in tx_extra (per-output) or main txPubKey
+    // Note: rctType already defined above
+    let enoteEphemeralPubkey = null;
+
+    if (rctType >= 8 && txPubKey) {
+      // CARROT (SalviumZero=8 or SalviumOne=9): D_e is txPubKey from tx_extra
+      enoteEphemeralPubkey = typeof txPubKey === 'string'
+        ? hexToBytes(txPubKey)
+        : txPubKey;
+    } else {
+      // Fallback: check additional_pubkeys or main tx pubkey
+      const additionalPubKeys = extractAdditionalPubKeys(tx);
+      enoteEphemeralPubkey = additionalPubKeys[outputIndex];
+      if (enoteEphemeralPubkey) {
+        enoteEphemeralPubkey = typeof enoteEphemeralPubkey === 'string'
+          ? hexToBytes(enoteEphemeralPubkey)
+          : enoteEphemeralPubkey;
+      } else {
+        // Fallback to main tx pubkey (for coinbase/legacy)
+        enoteEphemeralPubkey = txPubKey;
+      }
     }
 
     const outputForScan = {
@@ -1079,7 +1107,6 @@ export class WalletSync {
       enoteEphemeralPubkey,
       encryptedAmount: tx.rct?.ecdhInfo?.[outputIndex]?.amount
     };
-
 
     // Scan with CARROT algorithm
     let result;
@@ -1162,7 +1189,10 @@ export class WalletSync {
       mask: result.mask,
       subaddressIndex: result.subaddressIndex,
       keyImage,
-      isCarrot: true
+      isCarrot: true,
+      // CARROT-specific data needed for spending
+      carrotEphemeralPubkey: enoteEphemeralPubkey ? bytesToHex(enoteEphemeralPubkey) : null,
+      carrotSharedSecret: result.sharedSecret  // Already hex from scanCarrotOutput
     };
   }
 

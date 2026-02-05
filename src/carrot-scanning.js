@@ -478,12 +478,22 @@ const T_BYTES = new Uint8Array([
 ]);
 
 /**
- * Derive one-time address extension G scalar
+ * Derive one-time address extension G scalar (sender_extension_g)
  * k^o_g = H_n[s^ctx_sr]("Carrot key extension G", C_a)
  * Key = s_sender_receiver, data = C_a
+ *
+ * Used for CARROT output secret key derivation:
+ *   output_secret_key = k_gi + sender_extension_g (main address)
+ *   output_secret_key = k_gi * k_subscal + sender_extension_g (subaddress)
+ *
+ * @param {Uint8Array|string} senderReceiverCtx - Contextualized shared secret (s_sr_ctx)
+ * @param {Uint8Array|string} amountCommitment - Amount commitment (C_a)
+ * @returns {Uint8Array} 32-byte scalar
  */
-function deriveOnetimeExtensionG(senderReceiverCtx, amountCommitment) {
+export function deriveOnetimeExtensionG(senderReceiverCtx, amountCommitment) {
   // Key is s_sender_receiver, transcript is just C_a
+  if (typeof senderReceiverCtx === 'string') senderReceiverCtx = hexToBytes(senderReceiverCtx);
+  if (typeof amountCommitment === 'string') amountCommitment = hexToBytes(amountCommitment);
   return deriveScalar(senderReceiverCtx, CARROT_DOMAIN.ONETIME_EXTENSION_G, amountCommitment);
 }
 
@@ -607,17 +617,27 @@ export function scanCarrotOutput(output, viewIncomingKey, accountSpendPubkey, in
 
   // Extract CARROT-specific fields
   const onetimeAddress = typeof output.key === 'string' ? hexToBytes(output.key) : output.key;
-  const viewTag = output.viewTag;
   const enoteEphemeralPubkey = typeof output.enoteEphemeralPubkey === 'string'
     ? hexToBytes(output.enoteEphemeralPubkey)
     : output.enoteEphemeralPubkey;
   const encryptedAmount = output.encryptedAmount;
 
+  // Normalize viewTag to Uint8Array
+  let viewTag = output.viewTag;
+  if (typeof viewTag === 'string') {
+    // Hex string - convert to bytes
+    viewTag = hexToBytes(viewTag);
+  } else if (Array.isArray(viewTag)) {
+    // Array of numbers - convert to Uint8Array
+    viewTag = new Uint8Array(viewTag);
+  }
+  // Now viewTag should be Uint8Array or original format
+
   if (!onetimeAddress) {
     throw new Error('scanCarrotOutput: onetimeAddress is required');
   }
-  if (!viewTag) {
-    throw new Error('scanCarrotOutput: viewTag is required');
+  if (!viewTag || viewTag.length !== 3) {
+    throw new Error(`scanCarrotOutput: viewTag is required and must be 3 bytes (got: ${viewTag?.length || 'null'})`);
   }
   if (!enoteEphemeralPubkey) {
     throw new Error('scanCarrotOutput: enoteEphemeralPubkey is required');

@@ -9,30 +9,82 @@
 
 import { parseAddress, hexToBytes, bytesToHex } from '../address.js';
 import {
-  buildTransaction, buildStakeTransaction, prepareInputs, estimateTransactionFee,
+  buildTransaction, buildStakeTransaction, buildBurnTransaction, buildConvertTransaction,
+  prepareInputs, estimateTransactionFee,
   selectUTXOs, serializeTransaction, TX_TYPE, DEFAULT_RING_SIZE
 } from '../transaction.js';
-import { getNetworkConfig, NETWORK_ID, getActiveAssetType } from '../consensus.js';
+import { getNetworkConfig, NETWORK_ID, getActiveAssetType, isCarrotActive } from '../consensus.js';
 import {
   generateKeyDerivation, deriveSecretKey, scalarAdd
 } from '../crypto/index.js';
 import { cnSubaddressSecretKey } from '../subaddress.js';
+import { deriveOnetimeExtensionG } from '../carrot-scanning.js';
 
 /**
  * Derive the output secret key needed for spending.
  *
- * @param {Object} output - WalletOutput with txPubKey, outputIndex
+ * For CryptoNote outputs: x = k_s + H_s(derivation || i)
+ * For CARROT outputs: x = k_gi + sender_extension_g
+ *   where sender_extension_g = H_n("Carrot key extension G", s_sr_ctx, C_a)
+ *
+ * @param {Object} output - WalletOutput with txPubKey, outputIndex, isCarrot, etc.
  * @param {Object} keys - Wallet keys { viewSecretKey, spendSecretKey }
- * @param {Object} [subaddressIndex] - { major, minor }
+ * @param {Object} [carrotKeys] - CARROT keys { generateImageKey } (for CARROT outputs)
  * @returns {Uint8Array} Output secret key
  */
-function deriveOutputSecretKey(output, keys) {
+function deriveOutputSecretKey(output, keys, carrotKeys = null) {
+  // CARROT outputs use a different derivation
+  if (output.isCarrot) {
+    if (!carrotKeys?.generateImageKey) {
+      throw new Error('CARROT output requires carrotKeys.generateImageKey for spending');
+    }
+    if (!output.carrotSharedSecret) {
+      throw new Error('CARROT output requires carrotSharedSecret for spending');
+    }
+    if (!output.commitment) {
+      throw new Error('CARROT output requires commitment for spending');
+    }
+
+    // Get k_gi (generate-image key)
+    const kGi = typeof carrotKeys.generateImageKey === 'string'
+      ? hexToBytes(carrotKeys.generateImageKey) : carrotKeys.generateImageKey;
+
+    // Get s_sr_ctx (shared secret) and C_a (commitment)
+    const sharedSecret = typeof output.carrotSharedSecret === 'string'
+      ? hexToBytes(output.carrotSharedSecret) : output.carrotSharedSecret;
+    const commitment = typeof output.commitment === 'string'
+      ? hexToBytes(output.commitment) : output.commitment;
+
+    // Compute sender_extension_g = H_n("Carrot key extension G", s_sr_ctx, C_a)
+    // For main address (0,0): output_secret_key = k_gi + sender_extension_g
+    // For subaddresses: output_secret_key = k_gi * k_subscal + sender_extension_g
+    const sub = output.subaddressIndex;
+    let outputSecretKey;
+
+    if (sub && (sub.major !== 0 || sub.minor !== 0)) {
+      // Subaddress: need to multiply k_gi by subaddress scalar
+      // For now, throw - subaddress spending needs more implementation
+      throw new Error('CARROT subaddress spending not yet implemented');
+    } else {
+      // Main address: x = k_gi + sender_extension_g
+      const senderExtG = deriveOnetimeExtensionG(sharedSecret, commitment);
+      outputSecretKey = scalarAdd(kGi, senderExtG);
+    }
+
+    return outputSecretKey;
+  }
+
+  // CryptoNote (legacy) derivation
   const txPubKey = typeof output.txPubKey === 'string'
     ? hexToBytes(output.txPubKey) : output.txPubKey;
   const viewSecretKey = typeof keys.viewSecretKey === 'string'
     ? hexToBytes(keys.viewSecretKey) : keys.viewSecretKey;
   let spendSecretKey = typeof keys.spendSecretKey === 'string'
     ? hexToBytes(keys.spendSecretKey) : keys.spendSecretKey;
+
+  if (!txPubKey) {
+    throw new Error('CryptoNote output requires txPubKey for spending');
+  }
 
   // For subaddresses, compute subaddress secret key
   const sub = output.subaddressIndex;
@@ -43,6 +95,38 @@ function deriveOutputSecretKey(output, keys) {
 
   const derivation = generateKeyDerivation(txPubKey, viewSecretKey);
   return deriveSecretKey(derivation, output.outputIndex, spendSecretKey);
+}
+
+/**
+ * Build a change address with the correct keys for the current hard fork.
+ * At CARROT heights (HF10+), uses CARROT keys (K_s, K^0_v).
+ * Otherwise uses legacy CN keys.
+ *
+ * @param {Object} wallet - Wallet object with keys and carrotKeys
+ * @param {Object} carrotKeys - Resolved CARROT keys
+ * @param {number} height - Current block height
+ * @param {string} network - Network name
+ * @returns {{ changeAddress: Object, viewSecretKey: string|null }}
+ */
+function buildChangeAddress(wallet, carrotKeys, height, network) {
+  if (carrotKeys?.primaryAddressViewPubkey && isCarrotActive(height, network)) {
+    return {
+      changeAddress: {
+        viewPublicKey: carrotKeys.primaryAddressViewPubkey,
+        spendPublicKey: carrotKeys.accountSpendPubkey,
+        isSubaddress: false
+      },
+      carrotViewSecretKey: carrotKeys.viewIncomingKey || null
+    };
+  }
+  return {
+    changeAddress: {
+      viewPublicKey: wallet.keys.viewPublicKey,
+      spendPublicKey: wallet.keys.spendPublicKey,
+      isSubaddress: false
+    },
+    carrotViewSecretKey: null
+  };
 }
 
 /**
@@ -144,7 +228,12 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
     isFrozen: false,
     assetType
   });
-  const spendable = allOutputs.filter(o => o.isSpendable(currentHeight));
+  const spendable = allOutputs.filter(o => {
+    if (!o.isSpendable(currentHeight)) return false;
+    // CARROT outputs need carrotSharedSecret and commitment for spending
+    if (o.isCarrot && (!o.carrotSharedSecret || !o.commitment)) return false;
+    return true;
+  });
 
   if (spendable.length === 0) {
     throw new Error('No spendable outputs available');
@@ -199,6 +288,9 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
   const IDENTITY_MASK = '0100000000000000000000000000000000000000000000000000000000000000';
   const { commit: pedersenCommit } = await import('../transaction/serialization.js');
 
+  // Resolve carrot keys from wallet structure
+  const carrotKeys = wallet.carrotKeys || wallet.keys?.carrotKeys || wallet.keys;
+
   const ownedForPrep = selectedOutputs.map((o, idx) => {
     let mask = o.mask;
     let commitment = o.commitment;
@@ -209,13 +301,8 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
       commitment = bytesToHex(pedersenCommit(o.amount, hexToBytes(IDENTITY_MASK)));
     }
 
-    // Debug: check if publicKey looks valid
-    const pkType = typeof o.publicKey;
-    const pkLen = o.publicKey?.length;
-    console.log(`[PREP DEBUG] Output ${idx}: publicKey type=${pkType}, len=${pkLen}, value=${String(o.publicKey).slice(0, 32)}...`);
-
     return {
-      secretKey: deriveOutputSecretKey(o, wallet.keys),
+      secretKey: deriveOutputSecretKey(o, wallet.keys, carrotKeys),
       publicKey: o.publicKey,
       amount: o.amount,
       mask,
@@ -231,18 +318,15 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
     assetType
   });
 
-  // 11. Build change address from wallet's primary address
-  const changeAddress = {
-    viewPublicKey: wallet.keys.viewPublicKey,
-    spendPublicKey: wallet.keys.spendPublicKey,
-    isSubaddress: false
-  };
+  // 11. Build change address (CARROT-aware)
+  const { changeAddress, carrotViewSecretKey } = buildChangeAddress(wallet, carrotKeys, currentHeight, options.network);
 
   // 12. Build the transaction
   const spendPub = typeof wallet.keys.spendPublicKey === 'string'
     ? hexToBytes(wallet.keys.spendPublicKey) : wallet.keys.spendPublicKey;
   const viewPub = typeof wallet.keys.viewPublicKey === 'string'
     ? hexToBytes(wallet.keys.viewPublicKey) : wallet.keys.viewPublicKey;
+
   const tx = buildTransaction(
     {
       inputs: preparedInputs,
@@ -257,28 +341,14 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
       returnAddress: spendPub,
       returnPubkey: viewPub,
       height: currentHeight,
-      network: options.network
+      network: options.network,
+      viewSecretKey: carrotViewSecretKey
     }
   );
-
-  // DEBUG: log TX structure
-  console.log(`  [DEBUG] TX version: ${tx.prefix.version}, RCT type: ${tx.rct.type}`);
-  console.log(`  [DEBUG] p_r: ${bytesToHex(typeof tx.rct.p_r === 'string' ? hexToBytes(tx.rct.p_r) : tx.rct.p_r).slice(0, 16)}...`);
-  console.log(`  [DEBUG] ecdhInfo[0]: ${tx.rct.ecdhInfo[0]?.slice(0, 16)}...`);
-  console.log(`  [DEBUG] outPk count: ${tx.rct.outPk.length}, pseudoOuts count: ${tx.rct.pseudoOuts.length}`);
-  console.log(`  [DEBUG] CLSAGs: ${tx.rct.CLSAGs?.length || 0}, BP+ proof: ${tx.rct.bulletproofPlus ? 'yes' : 'no'}`);
-  if (tx.rct.salvium_data) console.log(`  [DEBUG] salvium_data: type=${tx.rct.salvium_data.salvium_data_type}`);
 
   // 13. Serialize
   const serialized = serializeTransaction(tx);
   const txHex = bytesToHex(serialized);
-
-  // DEBUG: dump TX hex for analysis and round-trip test
-  try {
-    const fs = await import('fs');
-    fs.writeFileSync('/tmp/last_tx.hex', txHex);
-    console.log(`  [DEBUG] TX hex dumped to /tmp/last_tx.hex (${txHex.length / 2} bytes)`);
-  } catch (_e) { /* ignore */ }
 
   // 14. Broadcast
   if (!dryRun) {
@@ -287,7 +357,6 @@ export async function transfer({ wallet, daemon, destinations, options = {} }) {
       throw new Error(`Failed to broadcast: ${JSON.stringify(sendResp)}`);
     }
     const respData = sendResp.result || sendResp.data?.result || sendResp.data;
-    console.log(`  [DEBUG] Daemon response:`, JSON.stringify(respData));
     if (respData?.status !== 'OK') {
       const reason = respData?.reason || respData?.status || 'unknown';
       throw new Error(`Transaction rejected: ${reason}`);
@@ -352,7 +421,11 @@ export async function sweep({ wallet, daemon, address, options = {} }) {
     isFrozen: false,
     assetType
   });
-  let spendable = allOutputs.filter(o => o.isSpendable(currentHeight));
+  let spendable = allOutputs.filter(o => {
+    if (!o.isSpendable(currentHeight)) return false;
+    if (o.isCarrot && (!o.carrotSharedSecret || !o.commitment)) return false;
+    return true;
+  });
 
   if (spendable.length === 0) {
     throw new Error('No spendable outputs available');
@@ -389,6 +462,8 @@ export async function sweep({ wallet, daemon, address, options = {} }) {
   const IDENTITY_MASK = '0100000000000000000000000000000000000000000000000000000000000000';
   const { commit: pedersenCommit } = await import('../transaction/serialization.js');
 
+  const sweepCarrotKeys = wallet.carrotKeys || wallet.keys?.carrotKeys || wallet.keys;
+
   const ownedForPrep = spendable.map(o => {
     let mask = o.mask;
     let commitment = o.commitment;
@@ -400,7 +475,7 @@ export async function sweep({ wallet, daemon, address, options = {} }) {
     }
 
     return {
-      secretKey: deriveOutputSecretKey(o, wallet.keys),
+      secretKey: deriveOutputSecretKey(o, wallet.keys, sweepCarrotKeys),
       publicKey: o.publicKey,
       amount: o.amount,
       mask,
@@ -454,7 +529,6 @@ export async function sweep({ wallet, daemon, address, options = {} }) {
       throw new Error(`Failed to broadcast: ${JSON.stringify(sendResp.error || sendResp.data)}`);
     }
     const respData = sendResp.result || sendResp.data?.result || sendResp.data;
-    console.log(`  [DEBUG] Sweep daemon response:`, JSON.stringify(respData));
     if (respData?.status !== 'OK') {
       const reason = respData?.reason || respData?.status || 'unknown';
       throw new Error(`Transaction rejected: ${reason}`);
@@ -524,7 +598,11 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
     isFrozen: false,
     assetType
   });
-  const spendable = allOutputs.filter(o => o.isSpendable(currentHeight));
+  const spendable = allOutputs.filter(o => {
+    if (!o.isSpendable(currentHeight)) return false;
+    if (o.isCarrot && (!o.carrotSharedSecret || !o.commitment)) return false;
+    return true;
+  });
 
   if (spendable.length === 0) {
     throw new Error('No spendable outputs available');
@@ -569,6 +647,7 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
   // 7. Derive output secret keys
   const IDENTITY_MASK = '0100000000000000000000000000000000000000000000000000000000000000';
   const { commit: pedersenCommit } = await import('../transaction/serialization.js');
+  const stakeCarrotKeys = wallet.carrotKeys || wallet.keys?.carrotKeys || wallet.keys;
 
   const ownedForPrep = selectedOutputs.map(o => {
     let mask = o.mask;
@@ -580,7 +659,7 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
     }
 
     return {
-      secretKey: deriveOutputSecretKey(o, wallet.keys),
+      secretKey: deriveOutputSecretKey(o, wallet.keys, stakeCarrotKeys),
       publicKey: o.publicKey,
       amount: o.amount,
       mask,
@@ -597,25 +676,23 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
   });
 
   // 9. Return address = wallet's own address (stake returns here)
-  const returnAddress = {
-    viewPublicKey: wallet.keys.viewPublicKey,
-    spendPublicKey: wallet.keys.spendPublicKey,
-    isSubaddress: false
-  };
+  // For CARROT heights, use CARROT keys
+  const { changeAddress: stakeReturnAddress, carrotViewSecretKey: stakeViewKey } = buildChangeAddress(wallet, stakeCarrotKeys, currentHeight, network);
 
   // 10. Build stake transaction
   const tx = buildStakeTransaction(
     {
       inputs: preparedInputs,
       stakeAmount,
-      returnAddress,
+      returnAddress: stakeReturnAddress,
       fee: estimatedFee
     },
     {
       stakeLockPeriod,
       assetType,
       height: currentHeight,
-      network
+      network,
+      viewSecretKey: stakeViewKey
     }
   );
 
@@ -630,7 +707,6 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
       throw new Error(`Failed to broadcast: ${JSON.stringify(sendResp.error || sendResp.data)}`);
     }
     const respData = sendResp.result || sendResp.data?.result || sendResp.data;
-    console.log(`  [DEBUG] Stake daemon response:`, JSON.stringify(respData));
     if (respData?.status !== 'OK') {
       const reason = respData?.reason || respData?.status || 'unknown';
       throw new Error(`Transaction rejected: ${reason}`);
@@ -649,6 +725,345 @@ export async function stake({ wallet, daemon, amount, options = {} }) {
     fee: estimatedFee,
     stakeAmount,
     lockPeriod: stakeLockPeriod,
+    tx,
+    serializedHex: txHex,
+    inputCount: preparedInputs.length,
+    outputCount: tx.prefix.vout.length,
+    spentKeyImages
+  };
+}
+
+/**
+ * Burn SAL or other assets permanently.
+ *
+ * BURN transactions destroy coins by sending them to amount_burnt with
+ * destination_asset_type = "BURN". The burned amount is permanently removed
+ * from circulation.
+ *
+ * @param {Object} params
+ * @param {Object} params.wallet - { keys, storage }
+ * @param {Object} params.daemon - DaemonRPC instance
+ * @param {bigint|number} params.amount - Amount to burn (atomic units)
+ * @param {Object} params.options - { priority, network, dryRun, assetType }
+ * @returns {Promise<Object>} { txHash, fee, burnAmount, tx, serializedHex, inputCount, spentKeyImages }
+ */
+export async function burn({ wallet, daemon, amount, options = {} }) {
+  const {
+    priority = 'default',
+    network = 0,
+    dryRun = false,
+    assetType: assetTypeOpt = null
+  } = options;
+
+  const burnAmount = typeof amount === 'bigint' ? amount : BigInt(amount);
+
+  // Get current height
+  const infoResp = await daemon.getInfo();
+  if (!infoResp.success) throw new Error('Failed to get daemon info');
+  const currentHeight = infoResp.result?.height || infoResp.data?.height;
+
+  // Use HF-based asset type detection
+  const assetType = assetTypeOpt || getActiveAssetType(currentHeight, network);
+
+  // Get spendable outputs
+  const allOutputs = await wallet.storage.getOutputs({
+    isSpent: false,
+    isFrozen: false,
+    assetType
+  });
+  const spendable = allOutputs.filter(o => {
+    if (!o.isSpendable(currentHeight)) return false;
+    if (o.isCarrot && (!o.carrotSharedSecret || !o.commitment)) return false;
+    return true;
+  });
+
+  if (spendable.length === 0) {
+    throw new Error('No spendable outputs available');
+  }
+
+  // Estimate fee
+  let estimatedFee = estimateTransactionFee(2, 1, { priority });
+
+  // Select UTXOs
+  const target = burnAmount + estimatedFee;
+  const selection = selectUTXOs(
+    spendable.map(o => ({
+      amount: o.amount,
+      globalIndex: o.globalIndex,
+      keyImage: o.keyImage,
+      _output: o
+    })),
+    target,
+    estimatedFee / 2n,
+    { currentHeight }
+  );
+
+  if (!selection.selected || selection.selected.length === 0) {
+    throw new Error(`Insufficient balance for burn. Need ${target}, have ${spendable.reduce((s, o) => s + o.amount, 0n)}`);
+  }
+
+  // Recalculate fee with actual input count
+  estimatedFee = estimateTransactionFee(selection.selected.length, 1, { priority });
+
+  // Resolve global indices
+  const selectedOutputs = selection.selected.map(s => s._output);
+  await resolveGlobalIndices(selectedOutputs, daemon);
+
+  // Derive secret keys
+  const IDENTITY_MASK = '0100000000000000000000000000000000000000000000000000000000000000';
+  const { commit: pedersenCommit } = await import('../transaction/serialization.js');
+  const burnCarrotKeys = wallet.carrotKeys || wallet.keys?.carrotKeys || wallet.keys;
+
+  const ownedForPrep = selectedOutputs.map(o => {
+    let mask = o.mask;
+    let commitment = o.commitment;
+    if (!mask) {
+      mask = IDENTITY_MASK;
+      commitment = bytesToHex(pedersenCommit(o.amount, hexToBytes(IDENTITY_MASK)));
+    }
+    return {
+      secretKey: deriveOutputSecretKey(o, wallet.keys, burnCarrotKeys),
+      publicKey: o.publicKey,
+      amount: o.amount,
+      mask,
+      globalIndex: o.globalIndex,
+      assetTypeIndex: o.assetTypeIndex,
+      commitment
+    };
+  });
+
+  // Prepare inputs (fetch decoys)
+  const preparedInputs = await prepareInputs(ownedForPrep, daemon, {
+    ringSize: DEFAULT_RING_SIZE,
+    assetType
+  });
+
+  // Change address (CARROT-aware)
+  const { changeAddress, carrotViewSecretKey: burnCarrotViewKey } = buildChangeAddress(wallet, burnCarrotKeys, currentHeight, network);
+
+  // Build burn transaction
+  const tx = buildBurnTransaction(
+    {
+      inputs: preparedInputs,
+      burnAmount,
+      changeAddress,
+      fee: estimatedFee
+    },
+    {
+      assetType,
+      height: currentHeight,
+      network,
+      viewSecretKey: burnCarrotViewKey
+    }
+  );
+
+  // Serialize
+  const serialized = serializeTransaction(tx);
+  const txHex = bytesToHex(serialized);
+
+  // Broadcast
+  if (!dryRun) {
+    const sendResp = await daemon.sendRawTransaction(txHex, { source_asset_type: assetType });
+    if (!sendResp.success) {
+      throw new Error(`Failed to broadcast: ${JSON.stringify(sendResp.error || sendResp.data)}`);
+    }
+    const respData = sendResp.result || sendResp.data?.result || sendResp.data;
+    if (respData?.status !== 'OK') {
+      const reason = respData?.reason || respData?.status || 'unknown';
+      throw new Error(`Transaction rejected: ${reason}`);
+    }
+  }
+
+  const { keccak256 } = await import('../crypto/index.js');
+  const txHash = bytesToHex(keccak256(serialized));
+
+  const spentKeyImages = selection.selected.map(u => u.keyImage);
+
+  return {
+    txHash,
+    fee: estimatedFee,
+    burnAmount,
+    tx,
+    serializedHex: txHex,
+    inputCount: preparedInputs.length,
+    outputCount: tx.prefix.vout.length,
+    spentKeyImages
+  };
+}
+
+/**
+ * Convert between asset types (e.g., SAL to another asset or vice versa).
+ *
+ * CONVERT transactions enable cross-asset swaps using the protocol's
+ * conversion mechanism. A slippage amount is burned/minted based on the
+ * conversion rate.
+ *
+ * @param {Object} params
+ * @param {Object} params.wallet - { keys, storage }
+ * @param {Object} params.daemon - DaemonRPC instance
+ * @param {bigint|number} params.amount - Amount to convert (atomic units)
+ * @param {string} params.sourceAssetType - Source asset type (e.g., 'SAL')
+ * @param {string} params.destAssetType - Destination asset type
+ * @param {string} params.destAddress - Destination address for converted funds
+ * @param {Object} params.options - { priority, network, dryRun, slippageTolerance }
+ * @returns {Promise<Object>} { txHash, fee, convertAmount, tx, serializedHex, inputCount, spentKeyImages }
+ */
+export async function convert({ wallet, daemon, amount, sourceAssetType, destAssetType, destAddress, options = {} }) {
+  const {
+    priority = 'default',
+    network = 0,
+    dryRun = false,
+    slippageTolerance = 0.01 // 1% default slippage tolerance
+  } = options;
+
+  const convertAmount = typeof amount === 'bigint' ? amount : BigInt(amount);
+
+  // Parse destination address
+  const parsedDest = parseAddress(destAddress);
+  if (!parsedDest.valid) {
+    throw new Error(`Invalid destination address: ${destAddress} — ${parsedDest.error}`);
+  }
+
+  // Get current height
+  const infoResp = await daemon.getInfo();
+  if (!infoResp.success) throw new Error('Failed to get daemon info');
+  const currentHeight = infoResp.result?.height || infoResp.data?.height;
+
+  // Get spendable outputs of source asset type
+  const allOutputs = await wallet.storage.getOutputs({
+    isSpent: false,
+    isFrozen: false,
+    assetType: sourceAssetType
+  });
+  const spendable = allOutputs.filter(o => {
+    if (!o.isSpendable(currentHeight)) return false;
+    if (o.isCarrot && (!o.carrotSharedSecret || !o.commitment)) return false;
+    return true;
+  });
+
+  if (spendable.length === 0) {
+    throw new Error(`No spendable ${sourceAssetType} outputs available`);
+  }
+
+  // Estimate fee
+  let estimatedFee = estimateTransactionFee(2, 2, { priority }); // 2 outputs: converted + change
+
+  // Select UTXOs
+  const target = convertAmount + estimatedFee;
+  const selection = selectUTXOs(
+    spendable.map(o => ({
+      amount: o.amount,
+      globalIndex: o.globalIndex,
+      keyImage: o.keyImage,
+      _output: o
+    })),
+    target,
+    estimatedFee / 2n,
+    { currentHeight }
+  );
+
+  if (!selection.selected || selection.selected.length === 0) {
+    throw new Error(`Insufficient ${sourceAssetType} balance for convert. Need ${target}, have ${spendable.reduce((s, o) => s + o.amount, 0n)}`);
+  }
+
+  // Recalculate fee with actual input count
+  estimatedFee = estimateTransactionFee(
+    selection.selected.length,
+    selection.changeAmount > 0n ? 2 : 1,
+    { priority }
+  );
+
+  // Resolve global indices
+  const selectedOutputs = selection.selected.map(s => s._output);
+  await resolveGlobalIndices(selectedOutputs, daemon);
+
+  // Derive secret keys
+  const IDENTITY_MASK = '0100000000000000000000000000000000000000000000000000000000000000';
+  const { commit: pedersenCommit } = await import('../transaction/serialization.js');
+  const convertCarrotKeys = wallet.carrotKeys || wallet.keys?.carrotKeys || wallet.keys;
+
+  const ownedForPrep = selectedOutputs.map(o => {
+    let mask = o.mask;
+    let commitment = o.commitment;
+    if (!mask) {
+      mask = IDENTITY_MASK;
+      commitment = bytesToHex(pedersenCommit(o.amount, hexToBytes(IDENTITY_MASK)));
+    }
+    return {
+      secretKey: deriveOutputSecretKey(o, wallet.keys, convertCarrotKeys),
+      publicKey: o.publicKey,
+      amount: o.amount,
+      mask,
+      globalIndex: o.globalIndex,
+      assetTypeIndex: o.assetTypeIndex,
+      commitment
+    };
+  });
+
+  // Prepare inputs (fetch decoys)
+  const preparedInputs = await prepareInputs(ownedForPrep, daemon, {
+    ringSize: DEFAULT_RING_SIZE,
+    assetType: sourceAssetType
+  });
+
+  // Change address (CARROT-aware)
+  const { changeAddress, carrotViewSecretKey: convertViewKey } = buildChangeAddress(wallet, convertCarrotKeys, currentHeight, network);
+
+  // Destination for converted funds
+  const destination = {
+    viewPublicKey: parsedDest.viewPublicKey,
+    spendPublicKey: parsedDest.spendPublicKey,
+    isSubaddress: parsedDest.type === 'subaddress',
+    amount: convertAmount
+  };
+
+  // Build convert transaction
+  const tx = buildConvertTransaction(
+    {
+      inputs: preparedInputs,
+      convertAmount,
+      destination,
+      changeAddress,
+      fee: estimatedFee
+    },
+    {
+      sourceAssetType,
+      destAssetType,
+      slippageTolerance,
+      height: currentHeight,
+      network,
+      viewSecretKey: convertViewKey
+    }
+  );
+
+  // Serialize
+  const serialized = serializeTransaction(tx);
+  const txHex = bytesToHex(serialized);
+
+  // Broadcast
+  if (!dryRun) {
+    const sendResp = await daemon.sendRawTransaction(txHex, { source_asset_type: sourceAssetType });
+    if (!sendResp.success) {
+      throw new Error(`Failed to broadcast: ${JSON.stringify(sendResp.error || sendResp.data)}`);
+    }
+    const respData = sendResp.result || sendResp.data?.result || sendResp.data;
+    if (respData?.status !== 'OK') {
+      const reason = respData?.reason || respData?.status || 'unknown';
+      throw new Error(`Transaction rejected: ${reason}`);
+    }
+  }
+
+  const { keccak256 } = await import('../crypto/index.js');
+  const txHash = bytesToHex(keccak256(serialized));
+
+  const spentKeyImages = selection.selected.map(u => u.keyImage);
+
+  return {
+    txHash,
+    fee: estimatedFee,
+    convertAmount,
+    sourceAssetType,
+    destAssetType,
     tx,
     serializedHex: txHex,
     inputCount: preparedInputs.length,

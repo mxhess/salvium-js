@@ -117,8 +117,10 @@ export class WalletOutput {
     // Subaddress
     this.subaddressIndex = data.subaddressIndex || { major: 0, minor: 0 };
 
-    // CARROT flag
+    // CARROT flag and data
     this.isCarrot = data.isCarrot || false;
+    this.carrotEphemeralPubkey = data.carrotEphemeralPubkey || null;  // D_e for CARROT spending
+    this.carrotSharedSecret = data.carrotSharedSecret || null;        // s_sr_ctx for CARROT spending
 
     // Spending status
     this.isSpent = data.isSpent || false;
@@ -202,6 +204,8 @@ export class WalletOutput {
       txType: this.txType,
       txPubKey: this.txPubKey,
       isCarrot: this.isCarrot,
+      carrotEphemeralPubkey: this.carrotEphemeralPubkey,
+      carrotSharedSecret: this.carrotSharedSecret,
       isFrozen: this.isFrozen,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt

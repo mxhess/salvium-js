@@ -103,6 +103,7 @@ import {
   DEFAULT_RING_SIZE as _DEFAULT_RING_SIZE,
   FEE_PER_KB as _FEE_PER_KB, FEE_PER_BYTE as _FEE_PER_BYTE,
   FEE_PRIORITY as _FEE_PRIORITY,
+  CARROT_ENOTE_TYPE as _CARROT_ENOTE_TYPE,
   getFeeMultiplier as _getFeeMultiplier
 } from './transaction/constants.js';
 
@@ -143,6 +144,24 @@ const genCommitmentMask = _genCommitmentMask;
 const serializeTxPrefix = _serializeTxPrefix;
 const getTxPrefixHash = _getTxPrefixHash;
 const serializeRctBase = _serializeRctBase;
+const CARROT_ENOTE_TYPE = _CARROT_ENOTE_TYPE;
+
+// Local imports for CARROT output creation (re-exported above, need local refs)
+import {
+  generateJanusAnchor as _generateJanusAnchor,
+  buildRingCtInputContext as _buildRingCtInputContext,
+  deriveCarrotEphemeralPrivkey as _deriveCarrotEphemeralPrivkey,
+  computeCarrotEphemeralPubkey as _computeCarrotEphemeralPubkey,
+  computeCarrotSharedSecret as _computeCarrotSharedSecret,
+  deriveCarrotSenderReceiverSecret as _deriveCarrotSenderReceiverSecret,
+  deriveCarrotOnetimeExtensions as _deriveCarrotOnetimeExtensions,
+  computeCarrotOnetimeAddress as _computeCarrotOnetimeAddress,
+  deriveCarrotAmountBlindingFactor as _deriveCarrotAmountBlindingFactor,
+  deriveCarrotViewTag as _deriveCarrotViewTag,
+  encryptCarrotAnchor as _encryptCarrotAnchor,
+  encryptCarrotAmount as _encryptCarrotAmount,
+  computeCarrotSpecialAnchor as _computeCarrotSpecialAnchor
+} from './transaction/carrot-output.js';
 
 // =============================================================================
 // OUTPUT CREATION
@@ -986,8 +1005,6 @@ export function getPreMlsagHash(txPrefixHash, rctBaseSerialized, bpProof) {
 
   // hashes[0] = message (tx prefix hash)
   const hash0 = txPrefixHash;
-  console.log(`  [PRE-MLSAG] rctBase len: ${rctBaseSerialized.length}`);
-  console.log(`  [PRE-MLSAG] hash0 (prefixHash): ${[...hash0].map(x=>x.toString(16).padStart(2,'0')).join('').slice(0,32)}...`);
 
   // hashes[1] = H(serialized rctSigBase)
   const hash1 = keccak256(rctBaseSerialized);
@@ -1025,10 +1042,6 @@ export function getPreMlsagHash(txPrefixHash, rctBaseSerialized, bpProof) {
   for (const c of bpChunks) { bpData.set(c, off); off += c.length; }
   const hash2 = keccak256(bpData);
 
-  const _hex = b => [...b].map(x=>x.toString(16).padStart(2,'0')).join('');
-  console.log(`  [PRE-MLSAG] hash1 (H(rctBase)): ${_hex(hash1).slice(0,32)}...`);
-  console.log(`  [PRE-MLSAG] bp components: ${bpChunks.length} chunks, ${bpDataLen} bytes`);
-  console.log(`  [PRE-MLSAG] hash2 (H(bp)): ${_hex(hash2).slice(0,32)}...`);
   // prehash = H(hashes[0] || hashes[1] || hashes[2])
   const combined = new Uint8Array(96);
   combined.set(hash0, 0);
@@ -1714,69 +1727,201 @@ export function buildTransaction(params, options = {}) {
   // Generate transaction secret key
   const txSecretKey = providedTxSecKey || generateTxSecretKey();
 
+  // Generate key images for inputs FIRST (needed for CARROT input context)
+  const keyImages = inputs.map(input => {
+    return generateKeyImage(input.publicKey, input.secretKey);
+  });
+
+  // Determine TX version and RCT type based on hard fork BEFORE output creation
+  const txVersion = height > 0 ? getTxVersion(txType, height, network) : TX_VERSION.V2;
+  const rctType = height > 0 ? getRctType(height, network) : RCT_TYPE.BulletproofPlus;
+
   // Create outputs (destinations + change if needed)
   const outputs = [];
   const outputMasks = [];
   let outputIndex = 0;
 
-  // Add destination outputs
-  for (const dest of destinations) {
-    const amount = typeof dest.amount === 'bigint' ? dest.amount : BigInt(dest.amount);
+  // CARROT ephemeral key (D_e) — used as txPubKey for CARROT outputs
+  let carrotEphemeralPubkey = null;
 
-    // Parse destination address to get public keys
-    // Note: Caller should pre-parse addresses and provide viewPublicKey/spendPublicKey
-    const output = createOutput(
-      txSecretKey,
-      dest.viewPublicKey,
-      dest.spendPublicKey,
-      amount,
-      outputIndex,
-      dest.isSubaddress || false
-    );
+  if (rctType >= 9) {
+    // =========================================================================
+    // CARROT OUTPUT CREATION (SalviumOne / HF10+)
+    //
+    // Uses X25519 ECDH with CARROT key derivation:
+    //   1. Generate ephemeral private key d_e from anchor + input context
+    //   2. D_e = d_e * B (X25519 basepoint) — stored as txPubKey
+    //   3. For each output: s_sr = d_e * ConvertPointE(K_v), derive Ko, viewTag, etc.
+    //
+    // The destination's viewPublicKey and spendPublicKey must be CARROT keys
+    // (K^0_v and K_s from a CARROT address), not legacy CN keys.
+    // =========================================================================
 
-    outputs.push({
-      amount,
-      publicKey: output.outputPublicKey,
-      commitment: output.commitment,
-      encryptedAmount: output.encryptedAmount,
-      mask: output.mask,
-      viewTag: output.viewTag
-    });
-    outputMasks.push(output.mask);
-    outputIndex++;
+    // Build input context: 'R' || first_key_image
+    const inputContext = _buildRingCtInputContext(keyImages[0]);
+
+    // Use first destination's spend pubkey for d_e derivation
+    const allDests = [...destinations];
+    if (changeAmount > 0n && changeAddress) {
+      allDests.push({ ...changeAddress, amount: changeAmount, isChange: true });
+    }
+
+    const firstDest = allDests[0];
+    const firstSpendPub = typeof firstDest.spendPublicKey === 'string'
+      ? hexToBytes(firstDest.spendPublicKey) : firstDest.spendPublicKey;
+    const paymentId = new Uint8Array(8); // default zero payment ID
+
+    // Generate anchor and derive ephemeral private key
+    const firstAnchor = _generateJanusAnchor();
+    const d_e = _deriveCarrotEphemeralPrivkey(firstAnchor, inputContext, firstSpendPub, paymentId);
+
+    // D_e = d_e * B (X25519 basepoint)
+    carrotEphemeralPubkey = _computeCarrotEphemeralPubkey(d_e, firstSpendPub, firstDest.isSubaddress || false);
+
+    // Create CARROT outputs for each destination
+    for (const dest of destinations) {
+      const amount = typeof dest.amount === 'bigint' ? dest.amount : BigInt(dest.amount);
+      const destViewPub = typeof dest.viewPublicKey === 'string'
+        ? hexToBytes(dest.viewPublicKey) : dest.viewPublicKey;
+      const destSpendPub = typeof dest.spendPublicKey === 'string'
+        ? hexToBytes(dest.spendPublicKey) : dest.spendPublicKey;
+
+      // Compute shared secret: s_sr = d_e * ConvertPointE(K_v)
+      const s_sr = _computeCarrotSharedSecret(d_e, destViewPub);
+
+      // Contextualized secret: s^ctx_sr
+      const s_ctx = _deriveCarrotSenderReceiverSecret(s_sr, carrotEphemeralPubkey, inputContext);
+
+      // Amount blinding factor
+      const enoteType = CARROT_ENOTE_TYPE.PAYMENT;
+      const mask = _deriveCarrotAmountBlindingFactor(s_ctx, amount, destSpendPub, enoteType);
+
+      // Commitment: C_a = mask*G + amount*H
+      const commitment = commit(amount, mask);
+
+      // One-time address extensions
+      const { extensionG, extensionT } = _deriveCarrotOnetimeExtensions(s_ctx, commitment);
+
+      // One-time address: Ko = K_s + k^o_g * G + k^o_t * T
+      const Ko = _computeCarrotOnetimeAddress(destSpendPub, extensionG, extensionT);
+
+      // 3-byte view tag (uses UN-contextualized secret)
+      const viewTag = _deriveCarrotViewTag(s_sr, inputContext, Ko);
+
+      // Encrypted components
+      const anchor = _generateJanusAnchor(); // each output gets its own anchor for encryption
+      const anchorEnc = _encryptCarrotAnchor(anchor, s_ctx, Ko);
+      const amountEnc = _encryptCarrotAmount(amount, s_ctx, Ko);
+
+      outputs.push({
+        amount,
+        publicKey: Ko,
+        commitment,
+        encryptedAmount: amountEnc,
+        mask,
+        carrotViewTag: viewTag,
+        encryptedJanusAnchor: anchorEnc,
+        viewTag: null // no CN view tag for CARROT
+      });
+      outputMasks.push(mask);
+      outputIndex++;
+    }
+
+    // Add CARROT change output if there's change
+    if (changeAmount > 0n && changeAddress) {
+      const chgViewPub = typeof changeAddress.viewPublicKey === 'string'
+        ? hexToBytes(changeAddress.viewPublicKey) : changeAddress.viewPublicKey;
+      const chgSpendPub = typeof changeAddress.spendPublicKey === 'string'
+        ? hexToBytes(changeAddress.spendPublicKey) : changeAddress.spendPublicKey;
+
+      // Shared secret for change output
+      const s_sr_chg = _computeCarrotSharedSecret(d_e, chgViewPub);
+      const s_ctx_chg = _deriveCarrotSenderReceiverSecret(s_sr_chg, carrotEphemeralPubkey, inputContext);
+
+      // CHANGE enote type for amount blinding factor
+      const mask_chg = _deriveCarrotAmountBlindingFactor(s_ctx_chg, changeAmount, chgSpendPub, CARROT_ENOTE_TYPE.CHANGE);
+      const commitment_chg = commit(changeAmount, mask_chg);
+      const { extensionG: extG_chg, extensionT: extT_chg } = _deriveCarrotOnetimeExtensions(s_ctx_chg, commitment_chg);
+      const Ko_chg = _computeCarrotOnetimeAddress(chgSpendPub, extG_chg, extT_chg);
+      const viewTag_chg = _deriveCarrotViewTag(s_sr_chg, inputContext, Ko_chg);
+
+      // For self-send (change), compute special anchor
+      let anchor_chg;
+      if (viewSecretKey) {
+        const vsk = typeof viewSecretKey === 'string' ? hexToBytes(viewSecretKey) : viewSecretKey;
+        anchor_chg = _computeCarrotSpecialAnchor(carrotEphemeralPubkey, inputContext, Ko_chg, vsk);
+      } else {
+        anchor_chg = _generateJanusAnchor();
+      }
+      const anchorEnc_chg = _encryptCarrotAnchor(anchor_chg, s_ctx_chg, Ko_chg);
+      const amountEnc_chg = _encryptCarrotAmount(changeAmount, s_ctx_chg, Ko_chg);
+
+      outputs.push({
+        amount: changeAmount,
+        publicKey: Ko_chg,
+        commitment: commitment_chg,
+        encryptedAmount: amountEnc_chg,
+        mask: mask_chg,
+        carrotViewTag: viewTag_chg,
+        encryptedJanusAnchor: anchorEnc_chg,
+        viewTag: null,
+        isChange: true
+      });
+      outputMasks.push(mask_chg);
+    }
+  } else {
+    // =========================================================================
+    // CRYPTONOTE OUTPUT CREATION (pre-CARROT: rctType 6, 7, 8)
+    // =========================================================================
+
+    // Add destination outputs
+    for (const dest of destinations) {
+      const amount = typeof dest.amount === 'bigint' ? dest.amount : BigInt(dest.amount);
+
+      const output = createOutput(
+        txSecretKey,
+        dest.viewPublicKey,
+        dest.spendPublicKey,
+        amount,
+        outputIndex,
+        dest.isSubaddress || false
+      );
+
+      outputs.push({
+        amount,
+        publicKey: output.outputPublicKey,
+        commitment: output.commitment,
+        encryptedAmount: output.encryptedAmount,
+        mask: output.mask,
+        viewTag: output.viewTag
+      });
+      outputMasks.push(output.mask);
+      outputIndex++;
+    }
+
+    // Add change output if there's change
+    if (changeAmount > 0n && changeAddress) {
+      const changeOutput = createOutput(
+        txSecretKey,
+        changeAddress.viewPublicKey,
+        changeAddress.spendPublicKey,
+        changeAmount,
+        outputIndex,
+        changeAddress.isSubaddress || false
+      );
+
+      outputs.push({
+        amount: changeAmount,
+        publicKey: changeOutput.outputPublicKey,
+        commitment: changeOutput.commitment,
+        encryptedAmount: changeOutput.encryptedAmount,
+        mask: changeOutput.mask,
+        viewTag: changeOutput.viewTag,
+        isChange: true
+      });
+      outputMasks.push(changeOutput.mask);
+    }
   }
-
-  // Add change output if there's change
-  if (changeAmount > 0n && changeAddress) {
-    const changeOutput = createOutput(
-      txSecretKey,
-      changeAddress.viewPublicKey,
-      changeAddress.spendPublicKey,
-      changeAmount,
-      outputIndex,
-      changeAddress.isSubaddress || false
-    );
-
-    outputs.push({
-      amount: changeAmount,
-      publicKey: changeOutput.outputPublicKey,
-      commitment: changeOutput.commitment,
-      encryptedAmount: changeOutput.encryptedAmount,
-      mask: changeOutput.mask,
-      viewTag: changeOutput.viewTag,
-      isChange: true
-    });
-    outputMasks.push(changeOutput.mask);
-  }
-
-  // Generate key images for inputs
-  const keyImages = inputs.map(input => {
-    return generateKeyImage(input.publicKey, input.secretKey);
-  });
-
-  // Determine TX version and RCT type based on hard fork
-  const txVersion = height > 0 ? getTxVersion(txType, height, network) : TX_VERSION.V2;
-  const rctType = height > 0 ? getRctType(height, network) : RCT_TYPE.BulletproofPlus;
 
   // Sort outputs by public key (lexicographic) for CARROT (HF10+)
   // C++ sorts enotes by K_o: output_set_finalization.cpp:311-314
@@ -1817,7 +1962,6 @@ export function buildTransaction(params, options = {}) {
       keyImages.push(sortedKeyImages[i]);
     }
   }
-  console.log(`  [DEBUG buildTx] height=${height}, network=${network}, txType=${txType}, txVersion=${txVersion}, rctType=${rctType}`);
 
   // Build transaction prefix
   const txPrefix = {
@@ -1833,13 +1977,16 @@ export function buildTransaction(params, options = {}) {
       keyImage: keyImages[i]
     })),
     vout: outputs.map(output => {
+      // For BURN/CONVERT TXs, change outputs keep the source asset type
+      const outputAssetType = (output.isChange && txType === TX_TYPE.BURN)
+        ? sourceAssetType : destinationAssetType;
       if (rctType === 9) {
         // CARROT v1 output for SalviumOne (HF10+)
         return {
           type: TXOUT_TYPE.CARROT_V1,
           amount: 0n,
           target: output.publicKey,
-          assetType: destinationAssetType,
+          assetType: outputAssetType,
           carrotViewTag: output.carrotViewTag || new Uint8Array(3),
           encryptedJanusAnchor: output.encryptedJanusAnchor || new Uint8Array(16)
         };
@@ -1848,13 +1995,15 @@ export function buildTransaction(params, options = {}) {
         type: TXOUT_TYPE.TAGGED_KEY,
         amount: 0n,
         target: output.publicKey,
-        assetType: destinationAssetType,
+        assetType: outputAssetType,
         unlockTime: 0n,
         viewTag: output.viewTag
       };
     }),
     extra: {
-      txPubKey: getTxPublicKey(txSecretKey)
+      // For CARROT (rctType >= 9): txPubKey = D_e (CARROT ephemeral pubkey, X25519)
+      // For pre-CARROT: txPubKey = r*G (standard Ed25519 tx public key)
+      txPubKey: carrotEphemeralPubkey || getTxPublicKey(txSecretKey)
     },
     // Salvium-specific prefix fields
     txType,
@@ -1945,11 +2094,7 @@ export function buildTransaction(params, options = {}) {
     salvium_data: salvium_data
   };
 
-  // Debug: dump rctBase hex for comparison
   const rctBaseSerialized = serializeRctBase(rctBase);
-  const _h = b => [...b].map(x=>x.toString(16).padStart(2,'0')).join('');
-  console.log(`  [DEBUG] rctBase hex (first 100 chars): ${_h(rctBaseSerialized).slice(0, 100)}`);
-  console.log(`  [DEBUG] rctBase total bytes: ${rctBaseSerialized.length}`);
 
   // Calculate pre-MLSAG hash: H(prefixHash || H(rctSigBase) || H(bp+ components))
   const preMLsagHash = getPreMlsagHash(txPrefixHash, rctBaseSerialized, bpProof);
@@ -1968,16 +2113,6 @@ export function buildTransaction(params, options = {}) {
       // TCLSAG for SalviumOne — y=zero for non-carrot inputs (see tx_builder.cpp:1145)
       const secretKeyY = input.secretKeyY || new Uint8Array(32);
 
-      // Debug: verify ring contains the expected public key
-      const expectedPk = input.ring[input.realIndex];
-      const expectedPkHex = typeof expectedPk === 'string' ? expectedPk : bytesToHex(expectedPk);
-      const inputPkHex = typeof input.publicKey === 'string' ? input.publicKey : bytesToHex(input.publicKey);
-      if (expectedPkHex !== inputPkHex) {
-        console.log(`[TCLSAG DEBUG] WARNING: ring[${input.realIndex}] != input.publicKey`);
-        console.log(`  ring[${input.realIndex}]: ${expectedPkHex.slice(0, 32)}...`);
-        console.log(`  input.publicKey: ${inputPkHex.slice(0, 32)}...`);
-      }
-
       const sig = tclsagSign(
         preMLsagHash,
         input.ring,
@@ -1988,25 +2123,6 @@ export function buildTransaction(params, options = {}) {
         pseudoOuts[i],
         input.realIndex
       );
-
-      // Debug: verify signature key image matches expected
-      const expectedKI = typeof keyImages[i] === 'string' ? keyImages[i] : bytesToHex(keyImages[i]);
-      const sigIHex = typeof sig.I === 'string' ? sig.I : bytesToHex(sig.I);
-      if (sigIHex !== expectedKI) {
-        console.log(`[TCLSAG DEBUG] WARNING: sig.I != keyImages[${i}]`);
-        console.log(`  sig.I: ${sigIHex.slice(0, 32)}...`);
-        console.log(`  keyImages[${i}]: ${expectedKI.slice(0, 32)}...`);
-      }
-
-      // Debug: self-verify signature
-      const verifyResult = tclsagVerify(
-        preMLsagHash,
-        sig,
-        input.ring,
-        input.ringCommitments,
-        pseudoOuts[i]
-      );
-      console.log(`[TCLSAG DEBUG] Self-verify input ${i}: ${verifyResult ? 'PASS' : 'FAIL'}`);
 
       tclsags.push(sig);
     } else {
@@ -2044,48 +2160,6 @@ export function buildTransaction(params, options = {}) {
   } else {
     rctObj.CLSAGs = clsags;
   }
-
-  // === SELF-VERIFICATION (DEBUG) ===
-  {
-    const _toBytes = v => typeof v === 'string' ? hexToBytes(v) : v;
-    const _hex = b => bytesToHex(b instanceof Uint8Array ? b : hexToBytes(b));
-
-    // 1. Sum check: sum(pseudoOuts) == sum(outPk) + fee*H + amount_burnt*H + p_r
-    let sumPseudo = null;
-    for (const po of pseudoOuts) {
-      const pt = _toBytes(po);
-      sumPseudo = sumPseudo ? pointAddCompressed(sumPseudo, pt) : pt;
-    }
-
-    let sumOut = null;
-    for (const c of outputs.map(o => o.commitment)) {
-      const pt = _toBytes(c);
-      sumOut = sumOut ? pointAddCompressed(sumOut, pt) : pt;
-    }
-    // Add fee*H
-    const feeH = zeroCommit(feeBig);
-    sumOut = pointAddCompressed(sumOut, feeH);
-    // Add amount_burnt*H
-    if (amountBurnt > 0n) {
-      const burntH = zeroCommit(amountBurnt);
-      sumOut = pointAddCompressed(sumOut, burntH);
-    }
-    // Add p_r
-    sumOut = pointAddCompressed(sumOut, p_r);
-
-    const sumMatch = _hex(sumPseudo) === _hex(sumOut);
-    console.log(`  [VERIFY] Sum check: ${sumMatch ? 'PASS' : 'FAIL'}`);
-    if (!sumMatch) {
-      console.log(`    sumPseudo: ${_hex(sumPseudo)}`);
-      console.log(`    sumOut:    ${_hex(sumOut)}`);
-    }
-
-    // 2. PR proof: log info
-    if (salvium_data?.pr_proof) {
-      console.log(`  [VERIFY] PR proof: present, p_r=${_hex(p_r).slice(0,16)}...`);
-    }
-  }
-  // === END SELF-VERIFICATION ===
 
   const transaction = {
     prefix: txPrefix,
@@ -2133,7 +2207,8 @@ export function buildStakeTransaction(params, options = {}) {
     txSecretKey,
     useCarrot = false,
     height = 0,
-    network = 0
+    network = 0,
+    viewSecretKey = null
   } = options;
 
   if (!inputs || inputs.length === 0) {
@@ -2215,7 +2290,8 @@ export function buildStakeTransaction(params, options = {}) {
       protocolTxData,
       amountSlippageLimit: 0n,
       height,
-      network
+      network,
+      viewSecretKey
     }
   );
 }
@@ -2250,7 +2326,10 @@ export function buildBurnTransaction(params, options = {}) {
   const {
     assetType = 'SAL',
     txSecretKey,
-    useCarrot = false
+    useCarrot = false,
+    height = 0,
+    network = 0,
+    viewSecretKey = null
   } = options;
 
   if (!inputs || inputs.length === 0) {
@@ -2301,7 +2380,10 @@ export function buildBurnTransaction(params, options = {}) {
       returnAddress: null,
       returnPubkey: null,
       protocolTxData: null,
-      amountSlippageLimit: 0n
+      amountSlippageLimit: 0n,
+      height,
+      network,
+      viewSecretKey
     }
   );
 }
@@ -2345,7 +2427,10 @@ export function buildConvertTransaction(params, options = {}) {
 
   const {
     txSecretKey,
-    useCarrot = false
+    useCarrot = false,
+    height = 0,
+    network = 0,
+    viewSecretKey = null
   } = options;
 
   // Validate inputs
@@ -2441,7 +2526,10 @@ export function buildConvertTransaction(params, options = {}) {
       returnAddress,
       returnPubkey,
       protocolTxData: null,
-      amountSlippageLimit: slippageLimitBig
+      amountSlippageLimit: slippageLimitBig,
+      height,
+      network,
+      viewSecretKey
     }
   );
 }
